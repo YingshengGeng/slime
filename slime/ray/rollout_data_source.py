@@ -48,9 +48,11 @@ class RolloutDataSource:
         # TODO unify the two branches
         if self.dataset is not None:
             if self.sample_offset + num_samples <= len(self.dataset):
+                # if we can get all samples from the current offset
                 prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
                 self.sample_offset += num_samples
             else:
+                # else we need to wrap around the dataset
                 prompt_samples = self.dataset.samples[self.sample_offset :]
                 num_samples -= len(prompt_samples)
                 self.epoch_id += 1
@@ -67,6 +69,7 @@ class RolloutDataSource:
                     group.append(sample)
                 samples.append(group)
         else:
+            # if no dataset is provided, we generate samples with empty prompts
             for _ in range(num_samples):
                 group = []
                 for _ in range(self.args.n_samples_per_prompt):

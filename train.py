@@ -36,6 +36,9 @@ def train(args):
     # initialize the connection for weight update during training
     ray.get(actor_model.async_init_weight_update_connections(rollout_manager))
 
+    # [Change] initiliza the verification connection
+    ray.get(rollout_manager.async_init_verification_connections(actor_model))
+
     if args.offload:
         ray.get(rollout_manager.async_onload())
 
@@ -64,6 +67,8 @@ def train(args):
         ):
             # 
             ray.get(actor_model.async_save_model(rollout_id))
+            # rollout_global_dataset
+            # FIXME meaning of rollout_global_dataset
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.data_buffer.save.remote(rollout_id))
 

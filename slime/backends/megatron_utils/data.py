@@ -86,6 +86,7 @@ def get_data_iterator(args, model, rollout_data):
         // mpu.get_data_parallel_world_size(with_context_parallel=False)
     )
     num_local_gbs = args.global_batch_size // mpu.get_data_parallel_world_size(with_context_parallel=False)
+    # the gradient?
     num_steps_per_rollout = num_local_samples // num_local_gbs
 
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -110,10 +111,11 @@ def get_data_iterator(args, model, rollout_data):
         num_microbatches = []
         for i in range(num_steps_per_rollout):
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
+            # MARK in this range, get samples not exceeding max_tokens_per_gpu
             num_microbatches.append(
                 get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu, cp_size)
             )
-
+        # FIXME; why use max?
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
         dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group())
 

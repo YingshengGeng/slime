@@ -160,6 +160,92 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
+# [Change] 
+@torch.no_grad()
+def verification(args, model, data_iterator, num_microbatches, store_prefix=""):
+    """Only do the forward pass and calculate the logprob."""
+    # 1. prepare model & data & func
+    # 1.1 reset data iterator
+    # FIXME why reset for all iterators?
+    for iterator in data_iterator:
+        iterator.reset()
+    # 1.2 prepare model
+    config = get_model_config(model[0])
+    # Turn on evaluation mode which disables dropout.
+    for model_module in model:
+        model_module.eval()
+    # 1.3 prepare func
+    # FIXME how this func is used in parallel setting?
+    def forward_step(data_iterator, model: GPTModel):
+        """Forward training step.
+
+        Args:
+            data_iterator : Input data iterator
+            model (GPTModel): The GPT Model
+        """
+
+        # Get the batch.
+        batch = get_batch(data_iterator, ["tokens", "total_lengths", "response_lengths"])
+        unconcat_tokens = batch["unconcat_tokens"]
+        tokens = batch["tokens"]
+        packed_seq_params = batch["packed_seq_params"]
+        total_lengths = batch["total_lengths"]
+        response_lengths = batch["response_lengths"]
+        output_tensor = model(
+            input_ids=tokens,
+            position_ids=None,
+            attention_mask=None,
+            labels=None,
+            packed_seq_params=packed_seq_params,
+        )
+
+        return output_tensor, partial(
+            get_log_probs_and_entropy,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            with_entropy=args.use_rollout_entropy,
+        )
+    
+    # 2. run forward
+    forward_backward_func = get_forward_backward_func()
+    # Don't care about timing during evaluation
+    config.timers = None
+    forward_data_store = []
+    num_steps_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    for step_id in range(num_steps_per_rollout):
+        # collect_non_loss_data
+        forward_data_store += forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            # FIXME structure of num_microbatches
+            num_microbatches=num_microbatches[step_id],
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            forward_only=True,
+            collect_non_loss_data=True,
+        )
+        
+    # 3. Move model back to the train mode.
+    for model_module in model:
+        model_module.train()
+
+    # 4. process output
+    rollout_data = {}
+    # Store the results on the last stage
+    if mpu.is_pipeline_last_stage():
+        # FIXME structure of forward_data_store
+        keys = forward_data_store[0].keys()
+        for key in keys:
+            values = []
+            for value in forward_data_store:
+                assert isinstance(value[key], list)
+                values += value[key]
+
+            rollout_data[f"{store_prefix}{key}"] = values
+    return rollout_data
 @torch.no_grad()
 def forward_only(args, model, data_iterator, num_microbatches, store_prefix=""):
     """Only do the forward pass and calculate the logprob."""

@@ -266,3 +266,8 @@ class SGLangEngine(RayActor):
 
     def stop_profile(self):
         return requests.post(f"http://{self.server_args.host}:{self.server_args.port}/stop_profile", json={})
+
+    # [Change]
+    def connect_verification_actor(self, actor):
+        self.actor = actor
+        return

@@ -67,7 +67,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     rollout_data = {}
 
     rank = dist.get_rank()
-    # FIXME all broadcast, how returne?
+    # FIXME all broadcast, how return?
     if rank == 0:
         data = ray.get(rollout_data_ref.inner)
         dist.broadcast_object_list([data], src=0)
@@ -159,3 +159,6 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         rollout_data[key] = val
 
     return rollout_data
+
+
+def process
