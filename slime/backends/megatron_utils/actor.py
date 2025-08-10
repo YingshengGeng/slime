@@ -45,6 +45,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if i == dist.get_rank():
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+            # FIXME why use gloo
             dist.barrier(group=get_gloo_group())
 
         if self.args.debug_rollout_only:
@@ -55,6 +56,7 @@ class MegatronTrainRayActor(TrainRayActor):
             args
         )
         start_rollout_id = loaded_rollout_id + 1
+        # MARK use different tag to save cpu weights
         self.weights = {"actor": {}}
         self.update_cpu_params_dict(self.weights["actor"])
 
@@ -75,6 +77,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.model,
             self.weights,
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
+            # FIXME how quantization_config works？
             quantization_config=getattr(self.hf_config, "quantization_config", None),
             vocab_size=self.tokenizer.vocab_size if self.args.vocab_size is None else self.args.vocab_size,
         )
@@ -84,7 +87,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.rollout_engines = None
         self.data_buffer = None
-
+        # FIXME how rollout_data_postprocess works?
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
             from slime.utils.misc import load_function
@@ -184,6 +187,7 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         if self.args.offload:
+            # FIXME difference between cpu and wake_up
             self.wake_up(("model"))
 
         with timer("train"):
@@ -204,7 +208,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
-
+                # FIXME 这里是不是有些问题呀？
                 rollout_data.update(
                     self.compute_log_prob(
                         "old_actor" if self.args.keep_old_actor else "actor",
@@ -214,6 +218,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 )
                 # when there is old actor, we need to update the model params to actor manually
+                # MARK only keep one version?
                 if "old_actor" in self.weights:
                     self.update_gpu_params_dict(self.weights["actor"])
 

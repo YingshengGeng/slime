@@ -14,7 +14,7 @@ class Sample:
     prompt: Union[str, list[dict[str, str]]] = ""
     tokens: list[int] = field(default_factory=list)
     # response
-    response: str = ""
+    response: str = "" # 这里是 decode 后的 response
     response_length: int = 0
     label: Optional[str] = None
     reward: Optional[Union[float, dict[str, Any]]] = None

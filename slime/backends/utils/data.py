@@ -67,6 +67,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     rollout_data = {}
 
     rank = dist.get_rank()
+    # FIXME all broadcast, how returne?
     if rank == 0:
         data = ray.get(rollout_data_ref.inner)
         dist.broadcast_object_list([data], src=0)
@@ -77,12 +78,13 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 
     # save the unprocessed reward for logging
     rewards = data["rewards"]
+    # FIXME difference between raw_reward and rewards
     if "raw_reward" in data:
         raw_rewards = data["raw_reward"]
     else:
         raw_rewards = rewards
     rollout_data["raw_reward"] = raw_rewards
-
+    # FIXME difference between reward normalize and adv
     if args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"] and args.rewards_normalization:
         # group norm
         rewards = torch.tensor([r for r in rewards], dtype=torch.float)

@@ -52,20 +52,20 @@ class Buffer:
         """
         Return num_samples samples
         """
-
+        # FIXME meaning of sample
         samples = self._get_samples_from_buffer(num_samples)
         num_samples -= len(samples)
 
         if num_samples == 0:
             return samples
-
+        # if we don't have enough samples in the buffer, we need to get more samples from the data source
         samples += self.data_source.get_samples(num_samples=num_samples)
         return samples
 
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:
         if len(self.buffer) == 0 or num_samples == 0:
             return []
-
+        # here we use the buffer_filter
         samples = self.buffer_filter(self.args, self.rollout_id, self.buffer, num_samples)
         return samples
 
