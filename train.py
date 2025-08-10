@@ -47,6 +47,7 @@ def train(args):
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # TODO extract the duplicated eval logic
         if args.eval_interval is not None and rollout_id == 0:
+            # here is the first step of the epoch, we need to evaluate the model
             eval_rollout_data_ref = ray.get(rollout_manager.async_generate(rollout_id, evaluation=True))
             ray.get(actor_model.async_eval(rollout_id, eval_rollout_data_ref))
 
@@ -61,6 +62,7 @@ def train(args):
             (rollout_id + 1) % args.save_interval == 0
             or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
         ):
+            # 
             ray.get(actor_model.async_save_model(rollout_id))
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.data_buffer.save.remote(rollout_id))
@@ -68,13 +70,14 @@ def train(args):
         if args.offload:
             ray.get(actor_model.async_offload())
             ray.get(rollout_manager.async_onload())
-
+        # MARK offload then update weights
         ray.get(actor_model.async_update_weights())
 
         if args.eval_interval is not None and (
             (rollout_id + 1) % args.eval_interval == 0
             or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
         ):
+            # MARK: final condition is the final step of the epoch
             eval_rollout_data_ref = ray.get(rollout_manager.async_generate(rollout_id, evaluation=True))
             ray.get(actor_model.async_eval(rollout_id, eval_rollout_data_ref))
 
