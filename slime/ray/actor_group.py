@@ -124,3 +124,7 @@ class RayTrainGroup:
 
     def async_offload(self):
         return [actor.sleep.remote(("model")) for actor in self._actor_handlers]
+    
+    # [Change]
+    def async_verification(self,rollout_id, rollout_data_ref):
+        return [actor.do_verification.remote(rollout_id, rollout_data_ref) for actor in self._actor_handlers]

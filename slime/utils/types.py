@@ -25,6 +25,9 @@ class Sample:
         COMPLETED = "completed"
         TRUNCATED = "truncated"
         ABORTED = "aborted"
+        # [Change] Added SPECED, VERIFIED status
+        SPECED =  "speced"
+        VERIFIED = "verified"
 
     status: Status = Status.PENDING
     metadata: dict = field(default_factory=dict)

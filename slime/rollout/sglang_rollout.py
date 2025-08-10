@@ -62,6 +62,50 @@ class GenerateState(metaclass=SingletonMeta):
                 )
             )
         self.remaining_batch_size += len(samples)
+# [Change]
+async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
+    # 1. deal with initial status
+    state = GenerateState(args)
+
+    # 2. generate a single sample
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    # 2.1 deal with data payload & sampling para
+    payload = {
+        "sampling_params": sampling_params,
+        "return_logprob": args.use_token_output,
+        "top_logprobs_num": args.top_logprobs_num,
+    }
+    if len(sample.response) > 0:
+        input_token_ids = sample.tokens
+    else:
+        # First turn: initialize with prompt tokens
+        # FIXME when deal chat template
+        prompt_token_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
+        input_token_ids = prompt_token_ids
+        # Initialize sample.tokens with prompt for subsequent turns
+        if not sample.tokens:
+            sample.tokens = prompt_token_ids
+        # FIXME when to deal with spec
+    payload["input_ids"] = input_token_ids
+    # 2.2 post request
+    output = await post(url, payload, use_http2=args.use_http2)
+
+    # 3. deal with response
+    # 3.1 deal with metadata
+    new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+    sample.tokens = sample.tokens + new_response_tokens
+    sample.response_length += len(new_response_tokens)
+    sample.response += state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)
+    # 3.2 deal with sample status
+    # FIXME how to deal with truncated max or truncated spec
+    match output["meta_info"]["finish_reason"]["type"]:
+        case "length":
+            sample.status = Sample.Status.TRUNCATED
+        case "abort":
+            sample.status = Sample.Status.ABORTED
+        case "stop":
+            sample.status = Sample.Status.COMPLETED
+    return sample
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -167,6 +211,11 @@ async def generate_and_rm(args, sample: Sample, sampling_params: dict, evaluatio
         else:
             sample = await generate(args, sample, sampling_params)
 
+    # [Change] 
+    # FIXME how to deal with spec sample?
+    if sample.status == Sample.Status.SPECED:
+        return sample
+    
     if sample.status == Sample.Status.ABORTED:
         return sample
 

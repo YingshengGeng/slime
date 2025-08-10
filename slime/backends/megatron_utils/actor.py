@@ -29,7 +29,9 @@ from .update_weight_utils import (
     UpdateWeightFromTensor,
     UpdateWeightFromDistributed,
 )
-
+# [Change]
+import ray
+from slime.utils.ray_utils import Box
 
 class MegatronTrainRayActor(TrainRayActor):
     def init(self, args, role, wandb_run_id, with_ref=False):
@@ -317,3 +319,23 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights[model_tag] = {}
         self.update_cpu_params_dict(self.weights[model_tag])
+
+    def do_verification(self, rollout_id, rollout_data_ref):
+        # 1. Get rollout data.
+        rollout_data = self._get_rollout_data(rollout_data_ref)
+        # Create data iterator for log_probs and train.
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+        # 2. Compute log probabilities.
+        rollout_data.update(
+            # FIXME here we use old_actor to compute log prob for the new actor
+            self.compute_log_prob (
+                "old_actor" if self.args.keep_old_actor else "actor",
+                data_iterator,
+                num_microbatches,
+                store_prefix="",
+            )
+        )
+        # 3. return rollout data with log probabilities.
+        # FIXME how to return, the structure
+        return Box(ray.put(rollout_data))

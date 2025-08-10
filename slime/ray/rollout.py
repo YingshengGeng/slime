@@ -166,3 +166,7 @@ class RolloutManager:
 
     def async_onload(self):
         return [engine.resume_memory_occupation.remote() for engine in self.rollout_engines]
+
+    # [Change]
+    def async_init_verification_connections(self, actor_model):
+        return [engine.connect_verification_actor.remote(actor_model) for engine in self.rollout_engines]
