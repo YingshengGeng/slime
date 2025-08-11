@@ -9,12 +9,12 @@ from slime.utils.data import Dataset
 from slime.utils.http_utils import get, post
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.types import Sample
-
-from .rm_hub import async_rm, batched_async_rm
-
+# import ray
+from slime.utils.rm_hub import async_rm, batched_async_rm
+import argparse
 __all__ = ["generate_rollout"]
 
-
+# 单例模式应用
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -81,8 +81,6 @@ async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
     # didn't consider the partial rollout here
     prompt_tokens_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
     sample.tokens = prompt_tokens_ids
-    response = ""
-    response_token_ids = []
     # didn't consider the loss mask here
     round_number = 0
     max_round_number = args.rollout_max_new_tokens // 10 + 10
@@ -94,9 +92,10 @@ async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
         # 2.1 deal with data payload & sampling para
         payload = {
             "sampling_params": sampling_params,
-            "return_logprob": args.use_token_output,
-            "top_logprobs_num": args.top_logprobs_num,
+            "return_logprob": True,
+            "top_logprobs_num": state.tokenizer.vocab_size,
             "max_new_tokens" : min(10, args.rollout_max_new_tokens - sample.response_length),
+            "seed": 42
         }
         input_token_ids = sample.tokens
         payload["input_ids"] = input_token_ids
@@ -109,24 +108,27 @@ async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
         temp_tokens = sample.tokens + new_response_tokens
         temp_response_length = sample.response_length + len(new_response_tokens)
         temp_data = {
-            train_data = {
-                "tokens": [temp_tokens],
-                "response_lengths": [temp_response_length],
-                "sample_indices": [sample.inde]，
-                "rollout_log_probs": [output["meta_info"]["output_token_logprobs"]]
-            }
+            "tokens": [temp_tokens],
+            # is this necessary?
+            "response_lengths": [temp_response_length],
+            "sample_indices": [sample.index],
+            "rollout_log_probs": [output["meta_info"]["output_token_logprobs"]]
         }
         # FIXME didn't consider the async
-        verification_res = ray.get(actor.do_verification(rollout_id, temp_data))
+        # verification_res = ray.get(actor.do_verification(rollout_id, temp_data))
+        verification_res = {
+            "recompute_index": -1,
+            "recompute_ids": 0
+        }
         # transform the index from global to local
         response_recompute_index = verification_res["recompute_index"] - sample.response_length
         response_recompute_id = verification_res["recompute_ids"]
-        temp_new_response_tokens = temp_tokens[response_recompute_index:] + response_recompute_id
+        accepted_tokens = new_response_tokens[:response_recompute_index] + response_recompute_id
         
-        sample.tokens = sample.tokens + temp_new_response_tokens
-        sample.response_length += len(temp_new_response_tokens)
-        sample.response += state.tokenizer.decode(temp_new_response_tokens, skip_special_tokens=False)
-        if state.check_match_eos(temp_new_response_tokens[-1]):
+        sample.tokens = sample.tokens + accepted_tokens
+        sample.response_length += len(accepted_tokens)
+        sample.response += state.tokenizer.decode(accepted_tokens, skip_special_tokens=False)
+        if state.check_match_eos(accepted_tokens[-1]):
             sample.status = Sample.Status.COMPLETED
             break
         round_number += 1
@@ -143,25 +145,27 @@ async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.COMPLETED
     return sample
 
+
+
+
 if __name__ == "__main__":
     sglang_router_ip = "localhost"
     sglang_router_port = 30000
     use_http2 = True
-    args = argparse.ArgumentParser()
-    args.add_argument("--hf_checkpoint", type=str, default="meta-llama/Llama-2-7b-hf")
-    args.add_argument("--sglang_router_ip", type=str, default=sglang_router_ip)
-    args.add_argument("--sglang_router_port", type=int, default=sglang_router_port)
-    args.add_argument("--use_http2", type=bool, default=use_http2)
-    args.add_argument("--rollout_max_new_tokens", type=int, default=20)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hf_checkpoint", type=str, default="meta-llama/Llama-2-7b-hf")
+    parser.add_argument("--sglang_router_ip", type=str, default=sglang_router_ip)
+    parser.add_argument("--sglang_router_port", type=int, default=sglang_router_port)
+    parser.add_argument("--use_http2", type=bool, default=use_http2)
+    parser.add_argument("--rollout_max_new_tokens", type=int, default=10)
     # Example usage
     sample = Sample(prompt="Hello, world!", index=0)
     sampling_params = {
         "temperature": 1.0,
         "top_p": 1,
         "top_k": -1,
-        "max_new_tokens": 20,
-        "stop_token_ids": 
-        "skip_special_tokens": True,
+        "max_new_tokens": 104,
     }
+    args = parser.parse_args()
     result = run(spec_generate(args, sample, sampling_params))
     print(result)
