@@ -66,40 +66,66 @@ class GenerateState(metaclass=SingletonMeta):
 async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
     # 1. deal with initial status
     state = GenerateState(args)
-
     # 2. generate a single sample
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
-    # 2.1 deal with data payload & sampling para
-    payload = {
-        "sampling_params": sampling_params,
-        "return_logprob": args.use_token_output,
-        "top_logprobs_num": args.top_logprobs_num,
-    }
-    if len(sample.response) > 0:
+    # didn't consider the partial rollout here
+    prompt_tokens_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
+    sample.tokens = prompt_tokens_ids
+    response = ""
+    response_token_ids = []
+    # didn't consider the loss mask here
+    round_number = 0
+    max_round_number = args.rollout_max_new_tokens // 10 + 10
+    while round_number < max_round_number:
+        # 2.0 deal with the sample status
+        # FIXME maybe not strict
+        if sample.response_length >= args.rollout_max_response_len:
+            break
+        # 2.1 deal with data payload & sampling para
+        payload = {
+            "sampling_params": sampling_params,
+            "return_logprob": args.use_token_output,
+            "top_logprobs_num": args.top_logprobs_num,
+            "max_new_tokens" : min(10, args.rollout_max_new_tokens - sample.response_length),
+        }
         input_token_ids = sample.tokens
-    else:
-        # First turn: initialize with prompt tokens
-        # FIXME when deal chat template
-        prompt_token_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
-        input_token_ids = prompt_token_ids
-        # Initialize sample.tokens with prompt for subsequent turns
-        if not sample.tokens:
-            sample.tokens = prompt_token_ids
-        # FIXME when to deal with spec
-    payload["input_ids"] = input_token_ids
-    # 2.2 post request
-    output = await post(url, payload, use_http2=args.use_http2)
-
-    # 3. deal with response
-    # 3.1 deal with metadata
-    new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-    sample.tokens = sample.tokens + new_response_tokens
-    sample.response_length += len(new_response_tokens)
-    sample.response += state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)
+        payload["input_ids"] = input_token_ids
+        # 2.2 post request
+        output = await post(url, payload, use_http2=args.use_http2)
+        
+        # 3. deal with response
+        # 3.1 deal with metadata
+        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+        temp_tokens = sample.tokens + new_response_tokens
+        temp_response_length = sample.response_length + len(new_response_tokens)
+        temp_data = {
+            train_data = {
+                "tokens": [temp_tokens],
+                "response_lengths": [temp_response_length],
+                "sample_indices": [sample.inde]，
+                "rollout_log_probs": [output["meta_info"]["output_token_logprobs"]]
+            }
+        }
+        # FIXME didn't consider the async
+        verification_res = ray.get(actor.do_verification(rollout_id, temp_data))
+        # transform the index from global to local
+        response_recompute_index = verification_res["recompute_index"] - sample.response_length
+        response_recompute_id = verification_res["recompute_ids"]
+        temp_new_response_tokens = temp_tokens[response_recompute_index:] + response_recompute_id
+        
+        sample.tokens = sample.tokens + temp_new_response_tokens
+        sample.response_length += len(temp_new_response_tokens)
+        sample.response += state.tokenizer.decode(temp_new_response_tokens, skip_special_tokens=False)
+        if sample.tokens[-1] in args.rollout_stop_token_ids:
+            sample.status = Sample.Status.COMPLETED
+            break
+        round_number += 1
+  
     # 3.2 deal with sample status
     # FIXME how to deal with truncated max or truncated spec
     match output["meta_info"]["finish_reason"]["type"]:
         case "length":
+            # IF the last response is truncated, we should set the status to TRUNCATED
             sample.status = Sample.Status.TRUNCATED
         case "abort":
             sample.status = Sample.Status.ABORTED
@@ -223,6 +249,7 @@ async def generate_and_rm(args, sample: Sample, sampling_params: dict, evaluatio
     if args.group_rm:
         return sample
     # 生成结束够后进行 rm
+    
     sample.reward = await async_rm(args, sample)
 
     return sample

@@ -38,7 +38,6 @@ def train(args):
 
     # [Change] initiliza the verification connection
     ray.get(rollout_manager.async_init_verification_connections(actor_model))
-
     if args.offload:
         ray.get(rollout_manager.async_onload())
 
