@@ -7,7 +7,7 @@ import torch.distributed as dist
 from megatron.core import mpu
 
 from slime.backends.megatron_utils.cp_utils import get_logits_and_tokens_offset_with_cp
-
+from mpu.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 
 @torch.compile(dynamic=True)
 def compute_approx_kl(
@@ -83,6 +83,11 @@ def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group:
     tokens = tokens.unsqueeze(1)
     return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
 
+def compute_full_logits(logits: torch.Tensor, tokens: torch.Tensor, tp_process_group: Optional[dist.ProcessGroup]):
+    logits = logits.unsqueeze(1)
+    tokens = tokens.unsqueeze(1)
+    full_logits = tp_process_group.gather_from_tensor_model_parallel_region(logits)
+    return full_logits
 
 # from https://github.com/volcengine/verl/blob/0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99
 class _VocabParallelEntropy(torch.autograd.Function):
@@ -118,7 +123,6 @@ class _VocabParallelEntropy(torch.autograd.Function):
         vocab_parallel_logits.add_(sum_softmax_times_logits)
         softmax_logits.mul_(-1)
         return softmax_logits, None
-
 
 def compute_entropy_from_logits(logits: torch.Tensor, process_group) -> torch.Tensor:
     return _VocabParallelEntropy.apply(logits, process_group)

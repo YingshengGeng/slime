@@ -36,7 +36,44 @@ def calculate_log_probs_and_entropy(logits, tokens, with_entropy: bool = False):
     else:
         entropy = None
     return log_prob, entropy
+def calculate_full_logits(logits, tokens):
+    if logits.size(0) != 0:
+        full_logits = compute_full_logits(logits.clone(), tokens, mpu.get_tensor_model_parallel_group())
+    else:
+        full_logits = logits.new_zeros((0,))
+    return full_logits
 
+def get_full_logits(
+    logits: torch.Tensor,
+    *,
+    args,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    with_entropy: bool = False,
+    non_loss_data: bool = True,
+) -> dict[str, list[torch.Tensor]]:
+    # not consider CP
+    assert logits.size(0) == 1, f"{logits.shape}"
+    assert logits.dtype == torch.float32, f"{logits.dtype}"
+
+    logits = logits.squeeze(0)
+    logits.div_(args.rollout_temperature)
+
+    cp_size = mpu.get_context_parallel_world_size()
+    assert cp_size == 1, f"{cp_size}"
+
+    logits_list = []
+    end = 0
+    for tokens, total_length, response_length in zip(unconcat_tokens, total_lengths, response_lengths):
+        end += total_length
+        start = end - response_length
+        logits_chunk = logits[start - 1 : end - 1]
+        tokens_chunk = tokens[-response_length:]
+
+        logits = calculate_full_logits(logits_chunk, tokens_chunk)  
+        logits_list.append(logits)
+    return {"logits": logits_list}
 
 def get_log_probs_and_entropy(
     logits: torch.Tensor,

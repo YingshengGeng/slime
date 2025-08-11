@@ -320,9 +320,52 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights[model_tag] = {}
         self.update_cpu_params_dict(self.weights[model_tag])
 
+    def _get_verfication_data(self, rollout_data_ref):
+        verification_data = {}
+        
+        # receive data
+        rank = dist.get_rank()
+        if rank == 0:
+            data = ray.get(rollout_data_ref)
+            dist.broadcast_object_list([data], src=0)
+        else:
+            data = []
+            dist.broadcast_object_list(data, src=0)
+            data = data[0]
+        
+        # FIXME does not deal with rewards, adv
+        total_lengths = [len(t) for t in data["tokens"]]
+        data["total_lengths"] = total_lengths
+        
+        # FIXME dose not deal with balance data
+        # FIXME only the first data parallel rank will receive the data
+        def get_partition(val):
+            return val[dp_rank::dp_size]
+        
+        for key in [
+            "tokens",
+            "total_lengths",
+            "response_lengths",
+            "sample_indices",
+            "rollout_log_probs",
+        ]:
+            if key not in data:
+                continue
+            val = get_partition(data[key])
+            # move tokens to GPU in advance
+            if key == "tokens":
+                val = [torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in val]
+            elif key in ["rollout_log_probs"]:
+                val = [torch.tensor(t, dtype=torch.float, device=torch.cuda.current_device()) for t in val]
+                
+            verification_data[key] = val
+
+        return verification_data
+            
+    
     def do_verification(self, rollout_id, rollout_data_ref):
         # 1. Get rollout data.
-        rollout_data = self._get_rollout_data(rollout_data_ref)
+        rollout_data = self._get_verfication_data(rollout_data_ref)
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
@@ -330,12 +373,47 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data.update(
             # FIXME here we use old_actor to compute log prob for the new actor
             self.compute_log_prob (
-                "old_actor" if self.args.keep_old_actor else "actor",
+                "actor",
                 data_iterator,
                 num_microbatches,
                 store_prefix="",
             )
         )
-        # 3. return rollout data with log probabilities.
-        # FIXME how to return, the structure
+        # 3. use log probs to compute difference
+        diff = rollout_data["log_probs"] - rollout_data["rollout_log_probs"]
+        recompute_index = -1
+        with torch.no_grad():
+            for k in range(len(total_lengths)):
+                response_lengths = rollout_data["response_lengths"]
+                prefix_len = total_lengths[k] - response_lengths[k]
+                for i in range(response_lengths):
+                    r = torch.rand(1, device=torch.cuda.current_device())
+                    if r > torch.exp(diff[prefix_len + i]).item():
+                        # reject
+                        recompute_index = prefix_len + i
+                        break
+        rollout_data.update(
+            {
+                "recompute_index": recompute_index,
+                # "logits": 
+            }
+        )
+                        
+                
+        # 4. return rollout data with log probabilities.
+        # FIXME how to return, the structre and data type
+        """
+        return Box(
+            {
+                "tokens" list[Tensor],
+                "total_lengths": list[int],
+                "response_lengths": list[int],
+                "sample_indices": list[int],
+                "log_probs": list[Tensor],(FIXME)
+                "recompute_index": int,
+                "entropy"(Opt): list[Tensor],
+                
+            }
+        )
+        """
         return Box(ray.put(rollout_data))
