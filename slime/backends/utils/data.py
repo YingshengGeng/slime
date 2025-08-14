@@ -159,6 +159,3 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         rollout_data[key] = val
 
     return rollout_data
-
-
-def process

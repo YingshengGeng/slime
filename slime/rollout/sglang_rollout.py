@@ -2,18 +2,21 @@ import asyncio
 import copy
 
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoConfig
 
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.http_utils import get, post
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.types import Sample
-
+import argparse
+import logging
+import torch
+import ray
+from slime.utils.ray_utils import Box
 from .rm_hub import async_rm, batched_async_rm
-
+import requests
 __all__ = ["generate_rollout"]
-
 
 class GenerateState(metaclass=SingletonMeta):
     """
@@ -24,9 +27,12 @@ class GenerateState(metaclass=SingletonMeta):
         # persistant state for the generation process
         self.args = args
         self.tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        self.config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        # FIXME
         self.semaphore = asyncio.Semaphore(
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
+        
         self.sampling_params = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -47,82 +53,209 @@ class GenerateState(metaclass=SingletonMeta):
         self.pendings = set()
         self.aborted = False
 
-    def submit_generate_tasks(self, samples: list[list[Sample]]):
+    def submit_generate_tasks(self, samples: list[list[Sample]], actor_model):
         # 这里的提交是以 groups 的形式提交的，每个 group 相当于一个 batch (什么级别？)
-        for group in samples:
+        response = requests.get(
+            f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/list_workers"
+        )
+        # print(response)
+        urls = response.json()["urls"]
+        for index, group in enumerate(samples):
+
             self.pendings.add(
                 asyncio.create_task(
                     # submit a group of samples as a single task.
                     generate_and_rm_group(
                         self.args,
                         group,
+                        actor_model,
                         sampling_params=self.sampling_params.copy(),
                         evaluation=False,
+                        base_url= urls[index % len(urls)]  # distribute groups across workers
                     )
                 )
             )
         self.remaining_batch_size += len(samples)
+    def check_match_eos(self, last_token_id: int) -> bool:
+        matched_eos = False
+        if self.tokenizer is not None:
+            matched_eos |= last_token_id == self.tokenizer.eos_token_id
+        return matched_eos
+
+def sampling_from_probs_torch(probs: torch.Tensor):
+    """A sampling implementation with native pytorch operations, without
+    top-k, top-p, or min-p filtering."""
+    sampled_index = torch.multinomial(probs, num_samples=1)
+    batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
+    return batch_next_token_ids
+
+def sample_from_the_logits(logits, sampling_params) -> int:
+    # just support for top_k = -1, top_p = 1, tempature = 1.0
+    # just suppoert single example
+    assert (sampling_params["top_k"] == -1 and sampling_params["top_p"] == 1.0 and sampling_params["temperature"] == 1.0)
+    batch_logits = logits.unsqueeze(0)
+    sample_index = sampling_from_probs_torch(batch_logits)
+    return sample_index[0]
+
+def find_inconsistent_positions(log_probs_map_keys, target_order):
+    """
+    Finds the positions where two lists are inconsistent.
+
+    Args:
+        log_probs_map_keys: The keys from the log_probs_map.
+        target_order: The target order.
+
+    Returns:
+        A list of tuples, where each tuple contains the index and the values
+        from both lists at that index.
+    """
+    inconsistent_positions = []
+    # Ensure both lists have the same length
+    min_len = min(len(log_probs_map_keys), len(target_order))
+    for i in range(min_len):
+        if log_probs_map_keys[i] != target_order[i]:
+            inconsistent_positions.append((i, log_probs_map_keys[i], target_order[i]))
+    
+    # Check for length differences
+    if len(log_probs_map_keys) != len(target_order):
+        print(f"Warning: The lengths of the lists are different. log_probs_map_keys has {len(log_probs_map_keys)} elements, while target_order has {len(target_order)} elements.")
+
+    return inconsistent_positions
+
+def recovery_pros(full_top_logprobs: list[list]):
+    # [log_probs, idx, None] -> probs
+    log_probs_map = {item[1]: item[0] for item in full_top_logprobs}
+    target_order = range(len(full_top_logprobs))
+    ori_order = list(log_probs_map.keys())
+    ori_order.sort()
+    # print(find_inconsistent_positions(ori_order, list(target_order)))
+    # print(max(ori_order))
+    # print("len: ",  len(full_top_logprobs))
+    result_probs = []
+    for idx in target_order:
+        prob = log_probs_map.get(idx)
+        assert(prob is not None), f"idx {idx} not found in log_probs_map, index: {prob}"
+        result_probs.append(prob)
+    # print(result_probs)
+    new_dis = torch.exp(torch.tensor(result_probs, dtype=torch.float32))
+    # print("new_sum:", new_dis.sum().item())
+    return new_dis
+
 # [Change]
-async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
+async def spec_generate(args, sample: Sample, actor_model, sampling_params, base_url) -> Sample:
     # 1. deal with initial status
+    # logging.info(f"Generating sample {sample.index} with prompt: {sample.prompt}")
     state = GenerateState(args)
     # 2. generate a single sample
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    # url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+   
+
+    # abort all the requests
+    # MARK 对于所有的 worker 都发送 abort 的请求
+    # FIXME
+    url = f"{base_url}/generate"
     # didn't consider the partial rollout here
     prompt_tokens_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
     sample.tokens = prompt_tokens_ids
-    response = ""
-    response_token_ids = []
     # didn't consider the loss mask here
     round_number = 0
-    max_round_number = args.rollout_max_new_tokens // 10 + 10
+    round_tokens = 10
+    max_round_number = args.rollout_max_response_len // round_tokens + 10
+    max_new_tokens = sampling_params["max_new_tokens"]
     while round_number < max_round_number:
+        
         # 2.0 deal with the sample status
         # FIXME maybe not strict
         if sample.response_length >= args.rollout_max_response_len:
             break
         # 2.1 deal with data payload & sampling para
+        sampling_params["max_new_tokens"] = min(round_tokens, max_new_tokens - sample.response_length)
+        # logging.info(f"Round {round_number}: {sampling_params["max_new_tokens"]}")
+        # print("vocab_size", state.config.vocab_size )
         payload = {
             "sampling_params": sampling_params,
-            "return_logprob": args.use_token_output,
-            "top_logprobs_num": args.top_logprobs_num,
-            "max_new_tokens" : min(10, args.rollout_max_new_tokens - sample.response_length),
+            "return_logprob": True,
+            "top_logprobs_num": state.config.vocab_size,   
+            # "top_logprobs_num": 1,
+            # "max_new_tokens" : min(10, args.rollout_max_response_len - sample.response_length),
+            # "seed": 42
         }
         input_token_ids = sample.tokens
         payload["input_ids"] = input_token_ids
         # 2.2 post request
-        output = await post(url, payload, use_http2=args.use_http2)
         
+        output = await post(url, payload, use_http2=False)
+        # print(output)
         # 3. deal with response
         # 3.1 deal with metadata
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        temp_tokens = sample.tokens + new_response_tokens
-        temp_response_length = sample.response_length + len(new_response_tokens)
-        temp_data = {
-            train_data = {
-                "tokens": [temp_tokens],
-                "response_lengths": [temp_response_length],
-                "sample_indices": [sample.inde]，
-                "rollout_log_probs": [output["meta_info"]["output_token_logprobs"]]
-            }
-        }
-        # FIXME didn't consider the async
-        verification_res = ray.get(actor.do_verification(rollout_id, temp_data))
-        # transform the index from global to local
-        response_recompute_index = verification_res["recompute_index"] - sample.response_length
-        response_recompute_id = verification_res["recompute_ids"]
-        temp_new_response_tokens = temp_tokens[response_recompute_index:] + response_recompute_id
         
-        sample.tokens = sample.tokens + temp_new_response_tokens
-        sample.response_length += len(temp_new_response_tokens)
-        sample.response += state.tokenizer.decode(temp_new_response_tokens, skip_special_tokens=False)
-        if sample.tokens[-1] in args.rollout_stop_token_ids:
+        # logging.info(f"New response tokens: {new_response_tokens}")
+        # logging.info(f"New response: {state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)}")
+        temp_tokens = sample.tokens + new_response_tokens
+        # temp_response_length = sample.response_length + len(new_response_tokens)
+        temp_data = {
+            "tokens": [temp_tokens],
+            # FIXME is this necessary?
+            "response_lengths": [len(new_response_tokens)],
+            "sample_indices": [sample.index],
+            "rollout_log_probs": [[t[0] for t in output["meta_info"]["output_token_logprobs"]]]
+            
+        }
+        # print("rollout_log_probs:", temp_data["rollout_log_probs"][0])
+
+        
+        # FIXME didn't consider the async
+        # list[Box[ref]]
+        # print(output["meta_info"].keys())
+        verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
+        temp_data["rollout_full_log_probs"]  = [output["meta_info"]["output_top_logprobs"]]
+        # logging.info(f"rollout_full_log_probs: {len(temp_data['rollout_full_log_probs'][0])}")
+        # verification_res = {
+        #     "recompute_index": min(sampling_params["max_new_tokens"], 7) - 1,
+        #     "logits": torch.randn(state.config.vocab_size).tolist()
+        # }
+        # assert(verification_res["recompute_index"][0] == -1 or verification_res["recompute_index"][0] >= 0)
+        # transform the index from global to local
+        if verification_res["recompute_index"][0] == -1:
+            # if all accepted, and not exceed the max or eos,
+            # we can just append the new response tokens
+            if sample.response_length + len(new_response_tokens) < args.rollout_max_response_len and \
+            not state.check_match_eos(new_response_tokens[-1]):
+                new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0]), dim = -1)
+                recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+                accepted_tokens = new_response_tokens + [recompute_ids]
+            else:
+                accepted_tokens = new_response_tokens
+        else:
+            # if not all accepted, we need to reset the new response tokens
+            # FIXME data type
+            response_recompute_index = verification_res["recompute_index"][0]
+            # print(torch.tensor(temp_data["rollout_log_probs"][0][response_recompute_index]).shape)
+            
+            new_distribuation = recovery_pros(temp_data["rollout_full_log_probs"][0][response_recompute_index]) - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
+            new_distribuation = torch.clamp(new_distribuation,  min = 0)
+            recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+            response_recompute_index = verification_res["recompute_index"][0]
+            accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
+        print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
+        # logging.info(f"Recompute index: {verification_res['recompute_index']}")
+        # logging.info(f"Recompute token id: {recompute_ids}")
+        # logging.info(f"Accepted tokens: {accepted_tokens}")
+        
+        # print(f"Output: {accepted_tokens}")
+        sample.tokens = sample.tokens + accepted_tokens
+        sample.response_length += len(accepted_tokens)
+        # logging.info(f"Sample response length: {sample.response_length}")
+        sample.response += state.tokenizer.decode(accepted_tokens, skip_special_tokens=False)
+        
+        if state.check_match_eos(accepted_tokens[-1]):
             sample.status = Sample.Status.COMPLETED
             break
         round_number += 1
-  
     # 3.2 deal with sample status
     # FIXME how to deal with truncated max or truncated spec
+    # print(sample.response)
     match output["meta_info"]["finish_reason"]["type"]:
         case "length":
             # IF the last response is truncated, we should set the status to TRUNCATED
@@ -132,7 +265,6 @@ async def spec_generate(args, sample: Sample, sampling_params) -> Sample:
         case "stop":
             sample.status = Sample.Status.COMPLETED
     return sample
-
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     # generate a single sample
@@ -214,7 +346,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     return sample
 
 
-async def generate_and_rm(args, sample: Sample, sampling_params: dict, evaluation=False) -> Sample:
+async def generate_and_rm(args, sample: Sample, sampling_params: dict, actor_model = None, evaluation=False, base_url = None) -> Sample:
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
@@ -233,17 +365,21 @@ async def generate_and_rm(args, sample: Sample, sampling_params: dict, evaluatio
         if args.custom_generate_function_path is not None:
             custom_generate_func = load_function(args.custom_generate_function_path)
             # 相当于给了一个自定义的 generate
-            sample = await custom_generate_func(args, sample, sampling_params)
+            sample = await custom_generate_func(args, sample, actor_model, sampling_params)
         else:
-            sample = await generate(args, sample, sampling_params)
+            if evaluation:
+                sample = sample = await generate(args, sample, sampling_params)
+            else:
+                sample = sample = await spec_generate(args, sample, actor_model, sampling_params, base_url)
+            
 
     # [Change] 
     # FIXME how to deal with spec sample?
-    if sample.status == Sample.Status.SPECED:
-        return sample
+    # if sample.status == Sample.Status.SPECED:
+    #     return sample
     
-    if sample.status == Sample.Status.ABORTED:
-        return sample
+    # if sample.status == Sample.Status.ABORTED:
+    #     return sample
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -255,15 +391,16 @@ async def generate_and_rm(args, sample: Sample, sampling_params: dict, evaluatio
     return sample
 
 
-async def generate_and_rm_group(args, group: list[Sample], sampling_params: dict, evaluation=False) -> list[Sample]:
+async def generate_and_rm_group(args, group: list[Sample], actor_model, sampling_params: dict, evaluation=False, base_url=None) -> list[Sample]:
     # 从名字上来说是生成并且进行奖励, 相比较之前，这里使用 group 的方式进行处理
     state = GenerateState(args)
-
+    
     if state.aborted:
         return group
     # MARK: sampling 是 copy 的
+   
     group = await asyncio.gather(
-        *[generate_and_rm(args, sample, sampling_params.copy(), evaluation=evaluation) for sample in group]
+        *[generate_and_rm(args, sample, sampling_params.copy(), actor_model = actor_model, evaluation=evaluation, base_url = base_url) for sample in group]
     )
 
     # for the rm that need the whole group, we will not do the rm here
@@ -317,7 +454,7 @@ async def abort(args, rollout_id: int):
     return aborted_samples
 
 
-async def generate_rollout_async(args, rollout_id: int, data_source) -> list[list[Sample]]:
+async def generate_rollout_async(args, rollout_id: int, actor_model, data_source) -> list[list[Sample]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -352,7 +489,7 @@ async def generate_rollout_async(args, rollout_id: int, data_source) -> list[lis
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
-            state.submit_generate_tasks(samples)
+            state.submit_generate_tasks(samples, actor_model)
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -466,6 +603,7 @@ async def eval_rollout_single_dataset(args, rollout_id, name, path):
                     args,
                     sample,
                     sampling_params=sampling_params,
+                    actor_model = None,
                     evaluation=True,
                 )
             )
@@ -492,9 +630,9 @@ async def eval_rollout_single_dataset(args, rollout_id, name, path):
         }
     }
 
-
+# here
 # TODO remove this temp function
-def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
+def generate_rollout(args, rollout_id, data_buffer, actor_model, evaluation=False):
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -507,15 +645,15 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         list[list[Sample]]: a list of list of samples generated by the rollout
     """
     completed_samples, aborted_samples = generate_abortable_samples(
-        args, rollout_id, data_buffer.get_samples, evaluation=evaluation
+        args, rollout_id, data_buffer.get_samples, actor_model, evaluation=evaluation
     )
     # aborted sample 会被添加到 data_buffer 中
     data_buffer.add_samples(aborted_samples)
     return completed_samples
 
 
-def generate_abortable_samples(args, rollout_id, data_source, evaluation=False):
+def generate_abortable_samples(args, rollout_id, data_source, actor_model, evaluation=False):
     assert args.rollout_global_dataset
     if evaluation:
         return run(eval_rollout(args, rollout_id))
-    return run(generate_rollout_async(args, rollout_id, data_source))
+    return run(generate_rollout_async(args, rollout_id, actor_model, data_source))

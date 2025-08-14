@@ -213,7 +213,7 @@ def verification(args, model, data_iterator, num_microbatches, store_prefix=""):
     # Don't care about timing during evaluation
     config.timers = None
     forward_data_store = []
-    num_steps_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    num_steps_per_rollout = 1
     for step_id in range(num_steps_per_rollout):
         # collect_non_loss_data
         forward_data_store += forward_backward_func(
@@ -247,7 +247,7 @@ def verification(args, model, data_iterator, num_microbatches, store_prefix=""):
             rollout_data[f"{store_prefix}{key}"] = values
     return rollout_data
 @torch.no_grad()
-def forward_only(args, model, data_iterator, num_microbatches, store_prefix=""):
+def forward_only(args, model, data_iterator, num_microbatches, store_prefix="", is_veri = False):
     """Only do the forward pass and calculate the logprob."""
 
     # reset data iterator
@@ -302,7 +302,11 @@ def forward_only(args, model, data_iterator, num_microbatches, store_prefix=""):
     # Don't care about timing during evaluation
     config.timers = None
     forward_data_store = []
-    num_steps_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    if is_veri is True:
+        num_steps_per_rollout = 1
+    else:
+        num_steps_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    # print("num_steps_per_rollout: ",num_steps_per_rollout)
     for step_id in range(num_steps_per_rollout):
         # collect_non_loss_data
         forward_data_store += forward_backward_func(
@@ -322,6 +326,7 @@ def forward_only(args, model, data_iterator, num_microbatches, store_prefix=""):
 
     rollout_data = {}
     # Store the results on the last stage
+    # print("is_veri", is_veri)
     if mpu.is_pipeline_last_stage():
         keys = forward_data_store[0].keys()
         for key in keys:
@@ -330,7 +335,7 @@ def forward_only(args, model, data_iterator, num_microbatches, store_prefix=""):
                 assert isinstance(value[key], list)
                 values += value[key]
 
-            if args.use_dynamic_batch_size:
+            if args.use_dynamic_batch_size and is_veri is False:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
                 origin_values = [None] * len(values)

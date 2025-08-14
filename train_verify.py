@@ -3,9 +3,30 @@ import ray
 from slime.ray.placement_group import create_actor_group, create_placement_groups, create_rollout_manager
 from slime.utils.arguments import parse_args
 from slime.utils.wandb_utils import init_wandb_primary
+from generate_test import *
+from actor_test import * 
+from slime.backends.megatron_utils.actor  import *
+# from slime.ray.actor_group import RayTrainGroup
+from slime.rollout import sglang_rollout
+from slime import backends
+# from slime.ray.actor_group import RayTrainGroup
+
+
+
+def init_func():
+    backends.utils.data.DataIterator = DataIterator
+    MegatronTrainRayActor._get_verfication_data = get_verfication_data
+    MegatronTrainRayActor.do_verification = do_verification
+    # RayTrainGroup.async_verification = async_verification
+    MegatronTrainRayActor.forward_for_logits = forward_for_logits
+    # Buffer.buffer_generate = buffer_generate
+
+
+
 
 
 def train(args):
+    init_func()
     # allocate the GPUs
     pgs = create_placement_groups(args)
     wandb_run_id = init_wandb_primary(args)
@@ -37,7 +58,7 @@ def train(args):
     ray.get(actor_model.async_init_weight_update_connections(rollout_manager))
 
     # [Change] initiliza the verification connection
-    rollout_manager.async_init_verification_connections(actor_model)
+    ray.get(rollout_manager.data_buffer.init_verification_connections.remote(actor_model))
     if args.offload:
         ray.get(rollout_manager.async_onload())
 
@@ -48,13 +69,14 @@ def train(args):
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # TODO extract the duplicated eval logic
-        if args.eval_interval is not None and rollout_id == 0:
-            # here is the first step of the epoch, we need to evaluate the model
-            eval_rollout_data_ref = ray.get(rollout_manager.async_buffer_generate(rollout_id, evaluation=True))
-            ray.get(actor_model.async_eval(rollout_id, eval_rollout_data_ref))
+        # FIXME generate directly
+        # if args.eval_interval is not None and rollout_id == 0:
+        #     # here is the first step of the epoch, we need to evaluate the model
+        #     eval_rollout_data_ref = ray.get(rollout_manager.async_buffer_generate(rollout_id, evaluation=True))
+        #     ray.get(actor_model.async_eval(rollout_id, eval_rollout_data_ref))
 
         rollout_data_ref = ray.get(rollout_manager.async_buffer_generate(rollout_id))
-        
+
         if args.offload:
             ray.get(rollout_manager.async_offload())
 

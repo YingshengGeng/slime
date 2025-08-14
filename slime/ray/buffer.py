@@ -120,6 +120,42 @@ class Buffer:
 
         return Box(ray.put(data))
 
+    def buffer_generate(self, rollout_id, evaluation=False):
+        self.rollout_id = rollout_id
+        if self.args.debug_train_only and evaluation:
+            # if debug train only, we don't generate evaluation data
+            return Box(ray.put({}))
+
+        if not evaluation and self.args.load_debug_rollout_data:
+            data = torch.load(
+                open(self.args.load_debug_rollout_data.format(rollout_id=rollout_id), "rb"),
+            )["samples"]
+            data = [Sample.from_dict(sample) for sample in data]
+        else:
+            generate_rollout = self.eval_generate_rollout if evaluation else self.generate_rollout
+            data = generate_rollout(self.args, rollout_id, self, self.actor_model, evaluation=evaluation)
+            # flatten the data if it is a list of lists
+            if not evaluation and isinstance(data[0], list):
+                data = sum(data, [])
+
+        # TODO to be refactored (originally Buffer._set_data)
+        if not evaluation:
+            # TODO extract to a function during refactor
+            if (path_template := self.args.save_debug_rollout_data) is not None:
+                path = Path(path_template.format(rollout_id=self.rollout_id))
+                print(f"Save debug rollout data to {path}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    dict(
+                        rollout_id=self.rollout_id,
+                        samples=[sample.to_dict() for sample in data],
+                    ),
+                    path,
+                )
+            data = self._convert_samples_to_train_data(data)
+
+        return Box(ray.put(data))
+
     def get_data(self, rollout_id, evaluation=False):
         data_pool = self.train_data_pool if not evaluation else self.eval_data_pool
         assert rollout_id in data_pool
@@ -179,3 +215,8 @@ class Buffer:
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
+        
+    def init_verification_connections(self, actor_model):
+        # FIXME why can not return
+        print("self", actor_model)
+        self.actor_model = actor_model
