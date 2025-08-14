@@ -159,7 +159,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     sample.tokens = prompt_tokens_ids
     # didn't consider the loss mask here
     round_number = 0
-    round_tokens = 10
+    round_tokens = 4000
     max_round_number = args.rollout_max_response_len // round_tokens + 10
     max_new_tokens = sampling_params["max_new_tokens"]
     while round_number < max_round_number:

@@ -14,7 +14,7 @@ set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-
+export WANDB_KEY="76103382630a7e59454e9268dd69e25c461f910e"
 NVLINK_COUNT=$(nvidia-smi | grep -o "NVLink" | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
     HAS_NVLINK=1
@@ -46,8 +46,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
-   --rollout-temperature 0.8
-
+   --rollout-temperature 1.0
    --global-batch-size 256
    --balance-data
 )
@@ -97,15 +96,17 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   # --use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3-4B-test
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project slime-dev
+   --wandb-group qwen3-4B-test
+   --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 4
+   --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
+   --sglang-server-concurrency 256
+   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
 MISC_ARGS=(
@@ -121,7 +122,7 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -137,8 +138,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train_verify.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4\
-   --rollout-num-gpus 1\
-   --colocate\
+   --rollout-num-gpus 4\
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

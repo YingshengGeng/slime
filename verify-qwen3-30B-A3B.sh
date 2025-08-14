@@ -11,6 +11,28 @@ pkill -9 ray
 pkill -9 python
 
 set -ex
+export WANDB_KEY="76103382630a7e59454e9268dd69e25c461f910e"
+export MASTER_ADDR="28.12.128.178"
+export BASE_FOLDER="/root/Qwen3-30B_slime/"
+export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
+export NCCL_SOCKET_IFNAME=bond1
+export TORCH_DISTRIBUTED_DEBUG=INFO
+export NCCL_ASYNC_ERROR_HANDLING=1
+
+
+
+# if base folder not set raise error
+if [ -z "${BASE_FOLDER}" ]; then
+  echo "BASE_FOLDER is not set. Please set it to the base directory of your checkpoints."
+  exit 1
+fi
+
+if [ -z "${MASTER_ADDR}" ]; then
+  echo "MASTER_ADDR is not set. Please set it to the master node address."
+  exit 1
+fi
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
@@ -24,7 +46,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
+source "${SCRIPT_DIR}/scripts/models/qwen3-30B-A3B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen3-30B-A3B
@@ -32,7 +54,7 @@ CKPT_ARGS=(
    --ref-load /root/Qwen3-30B-A3B_torch_dist
    --load /root/Qwen3-30B_slime/
    --save /root/Qwen3-30B_slime/
-   --save-interval 20
+   --save-interval 100
 )
 
 ROLLOUT_ARGS=(
@@ -45,8 +67,8 @@ ROLLOUT_ARGS=(
    --num-rollout 3000
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
-   --rollout-temperature 0.8
+   --rollout-max-response-len 104
+   --rollout-temperature 1.0
 
    --global-batch-size 256
    --balance-data
@@ -101,15 +123,15 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   #--use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3-30B-A3B-test
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project slime-dev
+   --wandb-group qwen3-30B-A3B-test
+   --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 8
-   --sglang-mem-fraction-static 0.5
+   --sglang-mem-fraction-static 0.7
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
@@ -125,8 +147,17 @@ MISC_ARGS=(
 )
 
 # launch the master node of ray in container
-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+export no_proxy="127.0.0.1,${MASTER_ADDR}"
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+for WORKER_IP in $(awk '{print $1}' /root/slime/mpi_rack_hostfile); do
+  if [[ "$WORKER_IP" == "$MLP_WORKER_0_HOST" ]]; then
+    continue
+  fi
+  echo "Starting Ray worker on ${WORKER_IP}"
+  ssh root@"${WORKER_IP}" \
+    "pkill -9 sglang ; ray stop --force ; pkill -9 python ; ray start --address=${MASTER_ADDR}:6379 --num-gpus 8 --node-ip-address ${WORKER_IP} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265" &
+done
+wait
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -139,10 +170,10 @@ RUNTIME_ENV_JSON="{
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train.py \
+   -- python3 train_verify.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 8 \
-   # --colocate \
+   --rollout-num-gpus 8\
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
