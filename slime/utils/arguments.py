@@ -984,9 +984,9 @@ def parse_args(add_custom_arguments=None):
             "please use alltoall dispatcher instead."
         )
         args.moe_token_dispatcher_type = "alltoall"
-    args.sglang_schedule_policy = 'fcfs'
-    args.sglang_schedule_conservativeness=1.3
-    args.sglang_show_time_cost = True
+    # args.sglang_schedule_policy = 'fcfs'
+    # args.sglang_schedule_conservativeness=1
+    # args.sglang_show_time_cost = True
     sglang_validate_args(args)
 
     return args
