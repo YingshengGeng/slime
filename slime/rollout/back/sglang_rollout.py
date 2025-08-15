@@ -159,7 +159,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     sample.tokens = prompt_tokens_ids
     # didn't consider the loss mask here
     round_number = 0
-    round_tokens = 20
+    round_tokens = 100
     max_round_number = args.rollout_max_response_len // round_tokens + 10
     max_new_tokens = sampling_params["max_new_tokens"]
     while round_number < max_round_number:
@@ -209,7 +209,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         # list[Box[ref]]
         # print(output["meta_info"].keys())
         verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
-        # temp_data["rollout_full_log_probs"]  = [output["meta_info"]["output_top_logprobs"]]
+        temp_data["rollout_full_log_probs"]  = [output["meta_info"]["output_top_logprobs"]]
         # logging.info(f"rollout_full_log_probs: {len(temp_data['rollout_full_log_probs'][0])}")
         # verification_res = {
         #     "recompute_index": min(sampling_params["max_new_tokens"], 7) - 1,
@@ -217,34 +217,32 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         # }
         # assert(verification_res["recompute_index"][0] == -1 or verification_res["recompute_index"][0] >= 0)
         # transform the index from global to local
-        # if verification_res["recompute_index"][0] == -1:
-        #     # if all accepted, and not exceed the max or eos,
-        #     # we can just append the new response tokens
-        #     if sample.response_length + len(new_response_tokens) < args.rollout_max_response_len and \
-        #     not state.check_match_eos(new_response_tokens[-1]):
-        #         new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0]), dim = -1)
-        #         recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
-        #         accepted_tokens = new_response_tokens + [recompute_ids]
-        #     else:
-        #         accepted_tokens = new_response_tokens
-        # else:
-        #     # if not all accepted, we need to reset the new response tokens
-        #     # FIXME data type
-        #     response_recompute_index = verification_res["recompute_index"][0]
-        #     # print(torch.tensor(temp_data["rollout_log_probs"][0][response_recompute_index]).shape)
+        if verification_res["recompute_index"][0] == -1:
+            # if all accepted, and not exceed the max or eos,
+            # we can just append the new response tokens
+            if sample.response_length + len(new_response_tokens) < args.rollout_max_response_len and \
+            not state.check_match_eos(new_response_tokens[-1]):
+                new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0]), dim = -1)
+                recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+                accepted_tokens = new_response_tokens + [recompute_ids]
+            else:
+                accepted_tokens = new_response_tokens
+        else:
+            # if not all accepted, we need to reset the new response tokens
+            # FIXME data type
+            response_recompute_index = verification_res["recompute_index"][0]
+            # print(torch.tensor(temp_data["rollout_log_probs"][0][response_recompute_index]).shape)
             
-        #     new_distribuation = recovery_pros(temp_data["rollout_full_log_probs"][0][response_recompute_index]) - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
-        #     new_distribuation = torch.clamp(new_distribuation,  min = 0)
-        #     recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
-        #     response_recompute_index = verification_res["recompute_index"][0]
-        #     accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
-        # print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
-        
+            new_distribuation = recovery_pros(temp_data["rollout_full_log_probs"][0][response_recompute_index]) - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
+            new_distribuation = torch.clamp(new_distribuation,  min = 0)
+            recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+            response_recompute_index = verification_res["recompute_index"][0]
+            accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
+        print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
         # logging.info(f"Recompute index: {verification_res['recompute_index']}")
         # logging.info(f"Recompute token id: {recompute_ids}")
         # logging.info(f"Accepted tokens: {accepted_tokens}")
-        accepted_tokens = new_response_tokens
-        # print(f"Round {round_number}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
+        
         # print(f"Output: {accepted_tokens}")
         sample.tokens = sample.tokens + accepted_tokens
         sample.response_length += len(accepted_tokens)

@@ -36,29 +36,27 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/gsm8k/train.parquet
-   --input-key messages
+   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type math
+   --rm-type deepscaler
    --num-rollout 3000
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 1024
+   --rollout-max-response-len 8192
    --rollout-temperature 1.0
    --global-batch-size 256
-   --over-sampling-batch-size 64
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --balance-data
 )
 
 EVAL_ARGS=(
    --eval-interval 20
-   --eval-prompt-data gsm8k /root/gsm8k/test.parquet
-   --n-samples-per-eval-prompt 1
-   --eval-max-response-len 1024
-   --eval-top-k 1
+   --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
+   --n-samples-per-eval-prompt 16
+   --eval-max-response-len 16384
+   --eval-top-p 0.7
 )
 
 PERF_ARGS=(
@@ -100,7 +98,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-4B-test-gsm8k
+   --wandb-group qwen3-4B-test
    --wandb-key ${WANDB_KEY}
 )
 
