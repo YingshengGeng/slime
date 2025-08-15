@@ -73,10 +73,10 @@ def get_ver_data_iterator(args, model, rollout_data):
             - data_iterator: List of DataIterator objects for log probability evaluation.
             - num_microbatches: Number of microbatches for log probability evaluation.
     """
-    num_local_samples = 1 # FIXME
-    num_local_gbs = 1 # FIXME
+
+    num_local_gbs = len(rollout_data["response_lengths"]) // mpu.get_data_parallel_world_size(with_context_parallel=False)
     # the gradient?
-    num_steps_per_rollout = 1 # FIXME
+    num_steps_per_rollout = 1
 
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
     if vpp_size is None:
@@ -106,13 +106,12 @@ def async_generate(self, rollout_id, evaluation=False):
 def do_verification(self, rollout_id, rollout_data_ref):
     # 1. Get rollout data.
     rollout_data = self._get_verfication_data(rollout_data_ref)
-    if (len(rollout_data["total_lengths"]) == 0):
+    if (len(rollout_data["response_lengths"]) == 0):
         # empty data
         recompute_data = {
-            "recompute_index": [-1],
-            "recompute_ids": [-1],
-            "logits": [[]],
-            # "log_probs": [[]],
+            "recompute_index": [],
+            "recompute_ids": [],
+            "logits": [],
         }
         return Box(ray.put(recompute_data))
     # print(rollout_data)
@@ -131,16 +130,20 @@ def do_verification(self, rollout_id, rollout_data_ref):
         )
     )
     # 3. use log probs to compute difference
-    diff = rollout_data["log_probs"][0] - rollout_data["rollout_log_probs"][0]
-    recompute_index = -1
+    recompute_index_list = []
     with torch.no_grad():
-        for k in range(len(rollout_data["total_lengths"])):
-            for i in range(rollout_data["response_lengths"][k]):
-                r = torch.rand(1, device=torch.cuda.current_device())
-                if r > torch.exp(diff[i]).item():
-                    # reject
-                    recompute_index = i
-                    break
+        data_len = len(rollout_data["response_lengths"])
+        for i in range(data_len):
+            diff = rollout_data["log_probs"][0] - rollout_data["rollout_log_probs"][0]
+            recompute_index = -1
+            for k in range(len(rollout_data["total_lengths"])):
+                for i in range(rollout_data["response_lengths"][k]):
+                    r = torch.rand(1, device=torch.cuda.current_device())
+                    if r > torch.exp(diff[i]).item():
+                        # reject
+                        recompute_index = i
+                        break
+            recompute_index_list.append(recompute_index)
 
     # 3.1 get the full logits for recompute_index
     rollout_data.update(
@@ -149,19 +152,9 @@ def do_verification(self, rollout_id, rollout_data_ref):
             "actor",
             data_iterator,
             num_microbatches,
-            recompute_index,
-
+            recompute_index_list,
             store_prefix="",
         )
-    )
-
-    # FIXME 这里的log_probs 的对应关系？
-    rollout_data.update(
-        {
-            "recompute_index": [recompute_index],
-            # FIXME wether is -1
-            "recompute_ids": [0]
-        }
     )
      
 
@@ -170,19 +163,15 @@ def do_verification(self, rollout_id, rollout_data_ref):
     """
     return Box(
         {
-            "tokens" list[Tensor],
-            "total_lengths": list[int],
-            "response_lengths": list[int],
-            "sample_indices": list[int],
-            "log_probs": list[Tensor],(FIXME)
+            "logits": list[list[float]]
             "recompute_index": list[int],
             "recompute_ids": list[int],
         }
     )
     """
     recompute_data = {
-        "recompute_index": [recompute_index],
-        "recompute_ids": [0],
+        "recompute_index": recompute_index_list,
+        "recompute_ids": [0] * len(recompute_index_list),
         "logits": [data.cpu().tolist() for data in rollout_data["logits"]],
         # "log_probs": [data.cpu().tolist() for data in rollout_data["log_probs"]],
     }
@@ -246,7 +235,7 @@ def get_verfication_data(self, rollout_data_ref):
         
 
 @torch.no_grad()
-def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, recompute_index, store_prefix="",):
+def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, recompute_index_list, store_prefix="",):
     # 0. update the weights
     self.update_gpu_params_dict(self.weights[model_tag])
     # """Only do the forward pass and calculate the logprob."""
@@ -288,7 +277,7 @@ def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, r
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
-            recompute_index = recompute_index,
+            recompute_index = recompute_index_list,
             vocab_size = args.vocab_size 
         )
     # Turn on evaluation mode which disables dropout.
@@ -338,7 +327,7 @@ def get_full_logits(
     unconcat_tokens: list[torch.Tensor],
     total_lengths: list[int],
     response_lengths: list[int],
-    recompute_index: int,
+    recompute_index_list: list[int],
     vocab_size: int,
     non_loss_data: bool = True,
 ) -> dict[str, list[torch.Tensor]]:
@@ -354,40 +343,36 @@ def get_full_logits(
 
     logits_list = []
     end = 0
-    for tokens, total_length, response_length in zip(unconcat_tokens, total_lengths, response_lengths):
+    assert len(unconcat_tokens) == len(total_lengths) == len(response_lengths) == len(recompute_index_list)
+    for tokens, total_length, response_length, recompute_index in zip(unconcat_tokens, total_lengths, response_lengths, recompute_index_list):
         end += total_length
         start = end - response_length
         # If -1, we compute the next token, else for the index token
         if recompute_index != -1:
-            logits_chunk = logits[start - 1 : end - 1]
-            tokens_chunk = tokens[-response_length:]
+            # left shift one
+            logits_chunk = logits[start - 1 + recompute_index - 1: start - 1 + recompute_index + 1]
         else:
             # FIXME take two for maintain shape
             logits_chunk = logits[end - 2: end]
-            tokens_chunk = tokens[-2:]
-        logits = calculate_full_logits(logits_chunk, tokens_chunk)  
-        # print(logits.shape, vocab_size)
-        if recompute_index != -1:
-            # logits:[batch_size, 1, padded_vocab_size]
-            logits_list.append(logits[recompute_index][0][:vocab_size])
-        else:
-            logits_list.append(logits[-1][0][:vocab_size])
+        logits = calculate_full_logits(logits_chunk) 
+        # FIXME 
+        print("logits shape: ", logits.shape)
+        logits_list.append(logits[-1][0][:vocab_size])
+        
     return {"logits": logits_list}
 
 
-
-
-def calculate_full_logits(logits, tokens):
+def calculate_full_logits(logits):
     if logits.size(0) != 0:
-        full_logits = gather_full_logits(logits.clone(), tokens, mpu.get_tensor_model_parallel_group())
+        full_logits = gather_full_logits(logits.clone())
     else:
         full_logits = logits.new_zeros((0,))
     return full_logits
 
 
-def gather_full_logits(logits: torch.Tensor, tokens: torch.Tensor, tp_process_group: Optional[dist.ProcessGroup]):
+def gather_full_logits(logits: torch.Tensor):
     logits = logits.unsqueeze(1)
-    tokens = tokens.unsqueeze(1)
+    #FIXME how this gather right part of logits
     full_logits = gather_from_tensor_model_parallel_region(logits)
     return full_logits
 

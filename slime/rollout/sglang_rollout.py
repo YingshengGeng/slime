@@ -23,109 +23,7 @@ __all__ = ["generate_rollout"]
 import asyncio
 import time
 from asyncio import Future, Queue
-from typing import List, Tuple, Dict
-
-
-
-class BatchingManager:
-    def __init__(self, urls: List[str], max_batch_size: int = 128, batch_timeout: float = 120, recomputation_batch_timeout:float = 10):
-        """
-        初始化批处理管理器。
-
-        Args:
-            urls (List[str]): 提供服务的多个推理服务器 URL 列表。
-            max_batch_size (int): 每个批处理的最大请求数。
-            batch_timeout (float): 等待填满一个批处理的最大时间（秒）。
-        """
-        # [MODIFIED] 为不同类型的请求和每个 URL 创建独立的队列字典
-        urls = [url + '/generate' for url in urls]
-        self.recomputation_queues: Dict[str, Queue] = {url: Queue() for url in urls}
-        self.rollout_queues: Dict[str, Queue] = {url: Queue() for url in urls}
-        
-        self.rollout_max_batch_size = max_batch_size
-        self.recomputation_max_batch_size = 32
-        self.rollout_batch_timeout = batch_timeout
-        self.recomputation_batch_timeout = recomputation_batch_timeout
-        self.worker_tasks = []
-
-        # [MODIFIED] 为每一个队列创建一个专属的后台 worker 任务
-        for url in urls:
-            self.worker_tasks.append(
-                asyncio.create_task(
-                    self._batching_worker(url, self.recomputation_queues[url], 1)
-                )
-            )
-            self.worker_tasks.append(
-                asyncio.create_task(
-                    self._batching_worker(url, self.rollout_queues[url], 0)
-                )
-            )
-
-    async def submit_request(self, url: str, payload: dict, existing_task_num) -> dict:
-        """
-        提交单个请求负载到相应的队列，并等待结果。
-        """
-        future = Future()
-        
-        if payload.get("sampling_params", {}).get("max_new_tokens") == 1:
-            await self.recomputation_queues[url].put((payload, future))
-            self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, min(existing_task_num/4, 1))
-        else:
-            await self.rollout_queues[url].put((payload, future))
-            self.rollout_max_batch_size = min(self.rollout_max_batch_size, min(existing_task_num,1))
-            
-        return await future
-
-    async def _batching_worker(self, url: str, queue: Queue, tag: int):
-        """
-        核心后台任务：收集请求，然后使用 asyncio.gather 并发调度它们。
-        """
-        
-        while True:
-            if tag == 0:
-                batch_size = self.rollout_max_batch_size
-                batch_timeout = self.rollout_batch_timeout
-            else:
-                batch_size = self.recomputation_max_batch_size
-                batch_timeout = self.recomputation_batch_timeout
-            requests: List[Tuple[dict, Future]] = []
-            
-            try:
-                first_payload, first_future = await queue.get()
-                requests.append((first_payload, first_future))
-            except asyncio.CancelledError:
-                break
-
-            while len(requests) < batch_size:
-                try:
-                    payload, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
-                    requests.append((payload, future))
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    break
-            
-            if not requests:
-                continue
-
-            batch_size = len(requests)
-            print(f"WORKER tag{tag} ({url[-1]}):  {batch_size} requests. Dispatching concurrently...")
-
-            futures = [req[1] for req in requests]
-
-            # [!!!] 核心修改：为批次中的每个请求创建一个 post 任务
-            # 我们不再合并 payload，而是为每个 payload 创建一个独立的 post 调用
-            post_tasks = [
-                post(url, req[0], use_http2=False) for req in requests
-            ]
-
-            # [!!!] 使用 asyncio.gather 并发执行所有独立的 post 请求
-            # return_exceptions=True 确保一个请求失败不会导致整个 gather 崩溃
-            concurrent_outputs = await asyncio.gather(*post_tasks, return_exceptions=True)
-            
-            print(f"WORKER tag{tag} ({url[-1]}): Batch of {batch_size} completed. Distributing results.")
-            
-            # 将结果分发回等待的 future
-            for i, output in enumerate(concurrent_outputs):
-                futures[i].set_result(output)
+from typing import List, Tuple, Dict, Any
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -173,12 +71,13 @@ class GenerateState(metaclass=SingletonMeta):
         
         # print(response)
         urls = response.json()["urls"]
-        self.manager = BatchingManager(urls)
+        self.manager = BatchingManager(urls, actor_model = actor_model)
         for index, group in enumerate(samples):
 
             self.pendings.add(
                 asyncio.create_task(
                     # submit a group of samples as a single task.
+                    # FIXME do not need actor
                     generate_and_rm_group(
                         self.args,
                         group,
@@ -191,6 +90,7 @@ class GenerateState(metaclass=SingletonMeta):
             )
         self.remaining_batch_size += len(samples)
         self.remaining_sample_size += sum(len(g) for g in samples)
+
     def check_match_eos(self, last_token_id: int) -> bool:
         matched_eos = False
         if self.tokenizer is not None:
@@ -267,6 +167,216 @@ def recovery_pros(full_top_logprobs: list[list]):
 #     payload["input_ids"] = input_token_ids
 #     output = await post(url, payload, use_http2=False)
 #     return recovery_pros(output["meta_info"]["output_top_logprobs"][0][0])
+class BatchingManager:
+    def __init__(self, urls: List[str], actor_model, max_batch_size: int = 128, batch_timeout: float = 10, recomputation_batch_timeout:float = 10):
+        """
+        初始化批处理管理器。
+
+        Args:
+            urls (List[str]): 提供服务的多个推理服务器 URL 列表。
+            max_batch_size (int): 每个批处理的最大请求数。
+            batch_timeout (float): 等待填满一个批处理的最大时间（秒）。
+        """
+        # [MODIFIED] 为不同类型的请求和每个 URL 创建独立的队列字典
+        urls = [url + '/generate' for url in urls]
+        self.recomputation_queues: Dict[str, Queue] = {url: Queue() for url in urls}
+        self.rollout_queues: Dict[str, Queue] = {url: Queue() for url in urls}
+        self.actor_queues: Queue = Queue()
+        # FIXME
+        self.actor_model = actor_model
+
+
+        self.rollout_max_batch_size = max_batch_size
+        self.rollout_batch_timeout = batch_timeout
+
+        self.recomputation_max_batch_size = 32
+        self.recomputation_batch_timeout = recomputation_batch_timeout
+        
+        self.verification_max_batch_size = max_batch_size
+        self.verification__batch_timeout = batch_timeout
+
+
+        self.worker_tasks = []
+
+        # [MODIFIED] 为每一个队列创建一个专属的后台 worker 任务
+        for url in urls:
+            self.worker_tasks.append(
+                asyncio.create_task(
+                    self._batching_worker(url, self.recomputation_queues[url], 1)
+                )
+            )
+            self.worker_tasks.append(
+                asyncio.create_task(
+                    self._batching_worker(url, self.rollout_queues[url], 0)
+                )
+            )
+
+    async def submit_request(self, url: str, payload: dict, existing_task_num) -> dict:
+        """
+        提交单个请求负载到相应的队列，并等待结果。
+        """
+        future = Future()
+        
+        if payload.get("sampling_params", {}).get("max_new_tokens") == 1:
+            await self.recomputation_queues[url].put((payload, future))
+            self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, min(existing_task_num/4, 1))
+        else:
+            await self.rollout_queues[url].put((payload, future))
+            self.rollout_max_batch_size = min(self.rollout_max_batch_size, min(existing_task_num,1))
+            
+        return await future
+    
+    async def submit_actor_request(self, temp_data: dict, existing_task_num) -> dict:
+        """
+        提交单个请求负载到 actor 队列，并等待结果。
+        """
+        future = Future()
+        await self.actor_queues.put((temp_data, future))
+        self.verification_max_batch_size = min(self.verification_max_batch_size, min(existing_task_num, 1))
+        return await future
+    
+    def _merger_request_batch(self, requests: List[Tuple[dict, Future]]) -> Dict[str, Any]:
+
+        batched_data = {
+            "tokens": [],
+            "response_lengths": [],
+            "sample_indices": [],
+            "rollout_log_probs": []
+        }
+
+        for data, _ in requests:
+            # Assumes each data dict contains lists of size 1
+            # FIXME list[list[data]] -> list[data]
+            batched_data["tokens"].extend(data["tokens"])
+            batched_data["response_lengths"].extend(data["response_lengths"])
+            batched_data["sample_indices"].extend(data["sample_indices"])
+            batched_data["rollout_log_probs"].extend(data["rollout_log_probs"])
+        return batched_data
+
+    def _split_results(self, batched_results: Dict[str, Any], num_requests: int) -> List[Dict[str, Any]]:
+        """Splits the batched verification result back into individual results."""
+        individual_results = []
+        for k in batched_results:
+            mini_batch_result = batched_results[k]
+            num = len(mini_batch_result["recompute_index"])
+            for i in range(num):
+                result = {
+                    # Assuming the result keys match this structure
+                    "recompute_index": [mini_batch_result["recompute_index"][i]],
+                    "logits": [mini_batch_result["logits"][i]]
+                }
+                individual_results.append(result)
+        assert(len(individual_results) == num_requests)
+        return individual_results
+
+
+    async def _verification_worker(self):
+        """Background worker to collect, batch, verify, and distribute results."""
+        while True:
+            batch_size = self.verification_max_batch_size
+            batch_timeout = self.verification__batch_timeout
+            requests: List[Tuple[Dict[str, Any], Future]] = []
+           
+            # Wait for the first request to start a new batch
+            first_data, first_future = await self.queue.get()
+            requests.append((first_data, first_future))
+
+            # Collect more requests until the batch is full or timeout occurs
+            while len(requests) < batch_size:
+                try:
+                    data, future = await asyncio.wait_for(self.queue.get(), timeout=batch_timeout)
+                    requests.append((data, future))
+                except asyncio.TimeoutError:
+                    break # Timeout hit, process the current batch
+
+            # 1. Merge all requests into a single, large payload
+            batched_data = self._merge_batch(requests)
+            if not batched_data:
+                continue
+
+            print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
+
+            # 2. Send the single, large batch to the Ray actor
+            # This is the core logic change
+            verification_future = self.actor_model.async_verification(0, Box(ray.put(batched_data)))
+            # list[Box[Object]], Obj [dict[str, list[Any]]]
+            box_list = ray.get(verification_future)
+            batched_results = [ray.get(box_list[i]).inner for i in range (len(box_list))]
+            
+            # 3. Split the batched result back into individual results
+            individual_results = self._split_results(batched_results, len(requests))
+
+            # 4. Distribute the individual results back to the waiting futures
+            for i, result in enumerate(individual_results):
+                original_future = requests[i][1]
+                original_future.set_result(result)
+            print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests.")
+
+
+    async def _batching_worker(self, url: str, queue: Queue, tag: int):
+        """
+        核心后台任务：收集请求，然后使用 asyncio.gather 并发调度它们。
+        """
+        
+        while True:
+            if tag == 0:
+                batch_size = self.rollout_max_batch_size
+                batch_timeout = self.rollout_batch_timeout
+            else:
+                batch_size = self.recomputation_max_batch_size
+                batch_timeout = self.recomputation_batch_timeout
+            requests: List[Tuple[dict, Future]] = []
+            
+            try:
+                first_payload, first_future = await queue.get()
+                requests.append((first_payload, first_future))
+            except asyncio.CancelledError:
+                break
+
+            while len(requests) < batch_size:
+                try:
+                    # FIXME 
+                    payload, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
+                    requests.append((payload, future))
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    break
+            
+            if not requests:
+                continue
+
+            batch_size = len(requests)
+            print(f"WORKER tag{tag} ({url[-1]}):  {batch_size} requests. Dispatching concurrently...")
+
+            futures = [req[1] for req in requests]
+
+            # [!!!] 核心修改：为批次中的每个请求创建一个 post 任务
+            # 我们不再合并 payload，而是为每个 payload 创建一个独立的 post 调用
+            post_tasks = [
+                post(url, req[0], use_http2=False) for req in requests
+            ]
+
+            # [!!!] 使用 asyncio.gather 并发执行所有独立的 post 请求
+            # return_exceptions=True 确保一个请求失败不会导致整个 gather 崩溃
+            concurrent_outputs = await asyncio.gather(*post_tasks, return_exceptions=True)
+            
+            print(f"WORKER tag{tag} ({url[-1]}): Batch of {batch_size} completed. Distributing results.")
+            
+            # 将结果分发回等待的 future
+            for i, output in enumerate(concurrent_outputs):
+                futures[i].set_result(output)
+
+
+    def abort(self):
+        """
+        Abort all pending requests and stop the batching workers.
+        """
+        for task in self.worker_tasks:
+            task.cancel()
+        self.worker_tasks = []
+        self.recomputation_queues.clear()
+        self.rollout_queues.clear()
+        self.actor_queues = Queue()
+
 import time
 # [Change]
 async def spec_generate(args, sample: Sample, actor_model, sampling_params, base_url) -> Sample:
@@ -297,7 +407,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         if sample.response_length >= args.rollout_max_response_len:
             break
         # 2.1 deal with data payload & sampling para
-        # start_rollout_request_time = time.time()
+        start_rollout_request_time = time.time()
         sampling_params["max_new_tokens"] = min(round_tokens, max_new_tokens - sample.response_length)
         payload = {
             "sampling_params": sampling_params,
@@ -309,9 +419,9 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         # 2.2 post request
         
         # output = await post(url, payload, use_http2=False)
-        output = await state.manager.submit_request(url, payload, state.remaining_sample_size)
-        # end_rollout_request_time = time.time()
-        # print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
+        output = await state.manager.submit_actor_request(payload, state.remaining_sample_size)
+        end_rollout_request_time = time.time()
+        print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
         # 3. deal with response
         # 3.1 deal with metadata
         # start_verification_time = time.time()
@@ -327,7 +437,8 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             
         }
         # FIXME didn't consider the async
-        verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
+        # verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
+        verification_res = await state.manager.submit_verification(temp_data)
         # end_verification_time = time.time()
         # print(f"Latency: Verification took {end_verification_time - start_verification_time:.4f} seconds.")
 
@@ -368,7 +479,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
         # end_recomputation_time = time.time()
         # print(f"Latency: Recomputation{verification_res['recompute_index']} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
-        # print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
+        print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
         # TEST 
         # accepted_tokens = new_response_tokens
         sample.tokens = sample.tokens + accepted_tokens
@@ -657,6 +768,8 @@ async def generate_rollout_async(args, rollout_id: int, actor_model, data_source
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
+    state.manager.abort()
+
 
     if over_sampling_filter is not None:
         # MARK ovly get the first batch size data
