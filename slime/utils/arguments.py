@@ -941,6 +941,7 @@ def parse_args(add_custom_arguments=None):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+        
 
     assert args.rollout_batch_size * args.n_samples_per_prompt % args.global_batch_size == 0, (
         f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
@@ -983,7 +984,9 @@ def parse_args(add_custom_arguments=None):
             "please use alltoall dispatcher instead."
         )
         args.moe_token_dispatcher_type = "alltoall"
-
+    args.sglang_schedule_policy = 'fcfs'
+    args.sglang_schedule_conservativeness=1.3
+    args.sglang_show_time_cost = True
     sglang_validate_args(args)
 
     return args

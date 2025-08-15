@@ -18,6 +18,105 @@ from .rm_hub import async_rm, batched_async_rm
 import requests
 __all__ = ["generate_rollout"]
 
+
+import asyncio
+import time
+from asyncio import Future, Queue
+from typing import List, Tuple, Dict
+
+
+
+class BatchingManager:
+    def __init__(self, urls: List[str], max_batch_size: int = 16, batch_timeout: float = 0.01):
+        """
+        初始化批处理管理器。
+
+        Args:
+            urls (List[str]): 提供服务的多个推理服务器 URL 列表。
+            max_batch_size (int): 每个批处理的最大请求数。
+            batch_timeout (float): 等待填满一个批处理的最大时间（秒）。
+        """
+        # [MODIFIED] 为不同类型的请求和每个 URL 创建独立的队列字典
+        self.recomputation_queues: Dict[str, Queue] = {url: Queue() for url in urls}
+        self.rollout_queues: Dict[str, Queue] = {url: Queue() for url in urls}
+        
+        self.max_batch_size = max_batch_size
+        self.batch_timeout = batch_timeout
+        self.worker_tasks = []
+
+        # [MODIFIED] 为每一个队列创建一个专属的后台 worker 任务
+        for url in urls:
+            self.worker_tasks.append(
+                asyncio.create_task(
+                    self._batching_worker(url, self.recomputation_queues[url])
+                )
+            )
+            self.worker_tasks.append(
+                asyncio.create_task(
+                    self._batching_worker(url, self.rollout_queues[url])
+                )
+            )
+
+    async def submit_request(self, url: str, payload: dict) -> dict:
+        """
+        提交单个请求负载到相应的队列，并等待结果。
+        """
+        future = Future()
+        
+        # [FIXED] 修正了判断逻辑和语法错误
+        # 通常 max_new_tokens == 1 用于重新计算或验证步骤
+        if payload.get("sampling_params", {}).get("max_new_tokens") == 1:
+            await self.recomputation_queues[url].put((payload, future))
+        else:
+            await self.rollout_queues[url].put((payload, future))
+            
+        return await future
+
+    async def _batching_worker(self, url: str, queue: Queue):
+        """
+        核心后台任务：收集请求，然后使用 asyncio.gather 并发调度它们。
+        """
+        while True:
+            requests: List[Tuple[dict, Future]] = []
+            
+            try:
+                first_payload, first_future = await queue.get()
+                requests.append((first_payload, first_future))
+            except asyncio.CancelledError:
+                break
+
+            while len(requests) < self.max_batch_size:
+                try:
+                    payload, future = await asyncio.wait_for(queue.get(), timeout=self.batch_timeout)
+                    requests.append((payload, future))
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    break
+            
+            if not requests:
+                continue
+
+            batch_size = len(requests)
+            print(f"WORKER({url[-1]}):  собираем {batch_size} requests. Dispatching concurrently...")
+
+            futures = [req[1] for req in requests]
+
+            # [!!!] 核心修改：为批次中的每个请求创建一个 post 任务
+            # 我们不再合并 payload，而是为每个 payload 创建一个独立的 post 调用
+            post_tasks = [
+                post(url, req[0], use_http2=False) for req in requests
+            ]
+
+            # [!!!] 使用 asyncio.gather 并发执行所有独立的 post 请求
+            # return_exceptions=True 确保一个请求失败不会导致整个 gather 崩溃
+            concurrent_outputs = await asyncio.gather(*post_tasks, return_exceptions=True)
+            
+            print(f"WORKER({url[-1]}): Batch of {batch_size} completed. Distributing results.")
+            
+            # 将结果分发回等待的 future
+            for i, output in enumerate(concurrent_outputs):
+                futures[i].set_result(output)
+
+
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -58,8 +157,10 @@ class GenerateState(metaclass=SingletonMeta):
         response = requests.get(
             f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/list_workers"
         )
+        
         # print(response)
         urls = response.json()["urls"]
+        self.manager = BatchingManager(urls)
         for index, group in enumerate(samples):
 
             self.pendings.add(
@@ -160,7 +261,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     state = GenerateState(args)
     # 2. generate a single sample
     # url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
-   
+    
 
     # abort all the requests
     # MARK 对于所有的 worker 都发送 abort 的请求
@@ -192,7 +293,8 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         payload["input_ids"] = input_token_ids
         # 2.2 post request
         
-        output = await post(url, payload, use_http2=False)
+        # output = await post(url, payload, use_http2=False)
+        output = await manager.submit_request(url, payload)
         end_rollout_request_time = time.time()
         print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
         # 3. deal with response
@@ -212,7 +314,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         # FIXME didn't consider the async
         verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
         end_verification_time = time.time()
-        print(f"Latency: Verification took {end_verification_time - start_verification_time:.4f} seconds.")
+        # print(f"Latency: Verification took {end_verification_time - start_verification_time:.4f} seconds.")
 
         # transform the index from global to local
         start_recomputation_time = time.time()
@@ -228,6 +330,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 accepted_tokens = new_response_tokens
         else:
             # if not all accepted, we need to reset the new response tokens
+            
             sampling_params["max_new_tokens"] = 1
             new_payload = {
                     "sampling_params": sampling_params,
@@ -236,16 +339,19 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             }
             new_payload["input_ids"] = input_token_ids
             new_output = await post(url, new_payload, use_http2=False)
+            start_recover_top_logprobs = time.time()
             response_recompute_index = verification_res["recompute_index"][0]
             # list[list[[prob,idx,None]]]
             rollout_probs = recovery_pros(new_output["meta_info"]["output_top_logprobs"][0])
+            end_recover_top_logprobs = time.time()
+            # print(f"Latency: Rollout Top Logprobs took {end_recover_top_logprobs - start_recover_top_logprobs:.4f} seconds.")
             # FIXME data type
             new_distribuation = rollout_probs - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
             new_distribuation = torch.clamp(new_distribuation,  min = 0)
             recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
             accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
         end_recomputation_time = time.time()
-        print(f"Latency: Recomputation{verification_res["recompute_index"][0]} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
+        # print(f"Latency: Recomputation{verification_res['recompute_index']} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
         print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
         # TEST 
         # accepted_tokens = new_response_tokens
@@ -374,10 +480,10 @@ async def generate_and_rm(args, sample: Sample, sampling_params: dict, actor_mod
             sample = await custom_generate_func(args, sample, actor_model, sampling_params)
         else:
             if evaluation:
-                sample = sample = await generate(args, sample, sampling_params)
+                sample = await generate(args, sample, sampling_params)
             else:
                 if args.use_verify:
-                    sample = sample = await spec_generate(args, sample, actor_model, sampling_params, base_url)
+                    sample = await spec_generate(args, sample, actor_model, sampling_params, base_url)
                 else:
                     sample = await generate(args, sample, sampling_params)
             
