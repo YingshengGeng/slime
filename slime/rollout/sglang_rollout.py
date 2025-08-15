@@ -192,7 +192,7 @@ class BatchingManager:
         self.recomputation_max_batch_size = 32
         self.recomputation_batch_timeout = recomputation_batch_timeout
         
-        self.verification_max_batch_size = max_batch_size
+        self.verification_max_batch_size = max_batch_size * 4
         self.verification__batch_timeout = batch_timeout
 
 
@@ -210,6 +210,12 @@ class BatchingManager:
                     self._batching_worker(url, self.rollout_queues[url], 0)
                 )
             )
+        self.worker_tasks.append (
+            asyncio.create_task(
+                # FIXME why?
+                self._verification_worker(self.actor_queues)
+            )
+        )
 
     async def submit_request(self, url: str, payload: dict, existing_task_num) -> dict:
         """
@@ -219,10 +225,10 @@ class BatchingManager:
         
         if payload.get("sampling_params", {}).get("max_new_tokens") == 1:
             await self.recomputation_queues[url].put((payload, future))
-            self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, min(existing_task_num/4, 1))
+            self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, max(existing_task_num/4, 1))
         else:
             await self.rollout_queues[url].put((payload, future))
-            self.rollout_max_batch_size = min(self.rollout_max_batch_size, min(existing_task_num,1))
+            self.rollout_max_batch_size = min(self.rollout_max_batch_size, max(existing_task_num,1))
             
         return await future
     
@@ -232,7 +238,7 @@ class BatchingManager:
         """
         future = Future()
         await self.actor_queues.put((temp_data, future))
-        self.verification_max_batch_size = min(self.verification_max_batch_size, min(existing_task_num, 1))
+        self.verification_max_batch_size = min(self.verification_max_batch_size, max(existing_task_num, 1))
         return await future
     
     def _merger_request_batch(self, requests: List[Tuple[dict, Future]]) -> Dict[str, Any]:
@@ -278,19 +284,19 @@ class BatchingManager:
             requests: List[Tuple[Dict[str, Any], Future]] = []
            
             # Wait for the first request to start a new batch
-            first_data, first_future = await self.queue.get()
+            first_data, first_future = await self.actor_queues.get()
             requests.append((first_data, first_future))
 
             # Collect more requests until the batch is full or timeout occurs
             while len(requests) < batch_size:
                 try:
-                    data, future = await asyncio.wait_for(self.queue.get(), timeout=batch_timeout)
+                    data, future = await asyncio.wait_for(self.actor_queues.get(), timeout=batch_timeout)
                     requests.append((data, future))
                 except asyncio.TimeoutError:
                     break # Timeout hit, process the current batch
 
             # 1. Merge all requests into a single, large payload
-            batched_data = self._merge_batch(requests)
+            batched_data = self._merger_request_batch(requests)
             if not batched_data:
                 continue
 
@@ -385,7 +391,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     state = GenerateState(args)
     # 2. generate a single sample
     # url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
-    print(f"start: {state.remaining_batch_size}")
+    print(f"start: {state.remaining_sample_size}")
 
     # abort all the requests
     # MARK 对于所有的 worker 都发送 abort 的请求
@@ -419,7 +425,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         # 2.2 post request
         
         # output = await post(url, payload, use_http2=False)
-        output = await state.manager.submit_actor_request(payload, state.remaining_sample_size)
+        output = await state.manager.submit_request(url, payload, state.remaining_sample_size)
         end_rollout_request_time = time.time()
         print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
         # 3. deal with response
@@ -438,7 +444,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         }
         # FIXME didn't consider the async
         # verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
-        verification_res = await state.manager.submit_verification(temp_data)
+        verification_res = await state.manager.submit_actor_request(temp_data, state.remaining_sample_size)
         # end_verification_time = time.time()
         # print(f"Latency: Verification took {end_verification_time - start_verification_time:.4f} seconds.")
 
@@ -767,8 +773,9 @@ async def generate_rollout_async(args, rollout_id: int, actor_model, data_source
     )
 
     # there are still some unfinished requests, abort them
-    aborted_samples = await abort(args, rollout_id)
     state.manager.abort()
+    aborted_samples = await abort(args, rollout_id)
+    
 
 
     if over_sampling_filter is not None:
