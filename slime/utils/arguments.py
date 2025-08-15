@@ -183,6 +183,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--use-verify",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether to use the verification mechanism during rollout. "
+                    "If set, we will first generate the response for each prompt, and then verify the response with the train model. "
+                ),
+            )
+
+            parser.add_argument(
                 "--use-token-output",
                 action="store_true",
                 default=False,

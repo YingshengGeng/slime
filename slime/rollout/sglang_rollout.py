@@ -141,6 +141,18 @@ def recovery_pros(full_top_logprobs: list[list]):
     # print("new_sum:", new_dis.sum().item())
     return new_dis
 
+# async def get_full_rollout_probs(url, input_token_ids, vocab_size, sampling_params):
+
+#     sampling_params["max_new_tokens"] = 1
+#     payload = {
+#             "sampling_params": sampling_params,
+#             "return_logprob": True,
+#             "top_logprobs_num": vocab_size,   
+#     }
+#     payload["input_ids"] = input_token_ids
+#     output = await post(url, payload, use_http2=False)
+#     return recovery_pros(output["meta_info"]["output_top_logprobs"][0][0])
+import time
 # [Change]
 async def spec_generate(args, sample: Sample, actor_model, sampling_params, base_url) -> Sample:
     # 1. deal with initial status
@@ -159,7 +171,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     sample.tokens = prompt_tokens_ids
     # didn't consider the loss mask here
     round_number = 0
-    round_tokens = 20
+    round_tokens = 100
     max_round_number = args.rollout_max_response_len // round_tokens + 10
     max_new_tokens = sampling_params["max_new_tokens"]
     while round_number < max_round_number:
@@ -169,15 +181,11 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         if sample.response_length >= args.rollout_max_response_len:
             break
         # 2.1 deal with data payload & sampling para
+        start_rollout_request_time = time.time()
         sampling_params["max_new_tokens"] = min(round_tokens, max_new_tokens - sample.response_length)
-        # logging.info(f"Round {round_number}: {sampling_params["max_new_tokens"]}")
-        # print("vocab_size", state.config.vocab_size )
         payload = {
             "sampling_params": sampling_params,
             "return_logprob": True,
-            "top_logprobs_num": state.config.vocab_size,   
-            # "top_logprobs_num": 1,
-            # "max_new_tokens" : min(10, args.rollout_max_response_len - sample.response_length),
             # "seed": 42
         }
         input_token_ids = sample.tokens
@@ -185,15 +193,14 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         # 2.2 post request
         
         output = await post(url, payload, use_http2=False)
-        # print(output)
+        end_rollout_request_time = time.time()
+        print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
         # 3. deal with response
         # 3.1 deal with metadata
+        start_verification_time = time.time()
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
         
-        # logging.info(f"New response tokens: {new_response_tokens}")
-        # logging.info(f"New response: {state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)}")
         temp_tokens = sample.tokens + new_response_tokens
-        # temp_response_length = sample.response_length + len(new_response_tokens)
         temp_data = {
             "tokens": [temp_tokens],
             # FIXME is this necessary?
@@ -202,50 +209,46 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             "rollout_log_probs": [[t[0] for t in output["meta_info"]["output_token_logprobs"]]]
             
         }
-        # print("rollout_log_probs:", temp_data["rollout_log_probs"][0])
-
-        
         # FIXME didn't consider the async
-        # list[Box[ref]]
-        # print(output["meta_info"].keys())
         verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
-        # temp_data["rollout_full_log_probs"]  = [output["meta_info"]["output_top_logprobs"]]
-        # logging.info(f"rollout_full_log_probs: {len(temp_data['rollout_full_log_probs'][0])}")
-        # verification_res = {
-        #     "recompute_index": min(sampling_params["max_new_tokens"], 7) - 1,
-        #     "logits": torch.randn(state.config.vocab_size).tolist()
-        # }
-        # assert(verification_res["recompute_index"][0] == -1 or verification_res["recompute_index"][0] >= 0)
+        end_verification_time = time.time()
+        print(f"Latency: Verification took {end_verification_time - start_verification_time:.4f} seconds.")
+
         # transform the index from global to local
-        # if verification_res["recompute_index"][0] == -1:
-        #     # if all accepted, and not exceed the max or eos,
-        #     # we can just append the new response tokens
-        #     if sample.response_length + len(new_response_tokens) < args.rollout_max_response_len and \
-        #     not state.check_match_eos(new_response_tokens[-1]):
-        #         new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0]), dim = -1)
-        #         recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
-        #         accepted_tokens = new_response_tokens + [recompute_ids]
-        #     else:
-        #         accepted_tokens = new_response_tokens
-        # else:
-        #     # if not all accepted, we need to reset the new response tokens
-        #     # FIXME data type
-        #     response_recompute_index = verification_res["recompute_index"][0]
-        #     # print(torch.tensor(temp_data["rollout_log_probs"][0][response_recompute_index]).shape)
-            
-        #     new_distribuation = recovery_pros(temp_data["rollout_full_log_probs"][0][response_recompute_index]) - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
-        #     new_distribuation = torch.clamp(new_distribuation,  min = 0)
-        #     recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
-        #     response_recompute_index = verification_res["recompute_index"][0]
-        #     accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
-        # print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
-        
-        # logging.info(f"Recompute index: {verification_res['recompute_index']}")
-        # logging.info(f"Recompute token id: {recompute_ids}")
-        # logging.info(f"Accepted tokens: {accepted_tokens}")
-        accepted_tokens = new_response_tokens
-        # print(f"Round {round_number}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
-        # print(f"Output: {accepted_tokens}")
+        start_recomputation_time = time.time()
+        if verification_res["recompute_index"][0] == -1:
+            # if all accepted, and not exceed the max or eos,
+            # we can just append the new response tokens
+            if sample.response_length + len(new_response_tokens) < args.rollout_max_response_len and \
+            not state.check_match_eos(new_response_tokens[-1]):
+                new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0]), dim = -1)
+                recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+                accepted_tokens = new_response_tokens + [recompute_ids]
+            else:
+                accepted_tokens = new_response_tokens
+        else:
+            # if not all accepted, we need to reset the new response tokens
+            sampling_params["max_new_tokens"] = 1
+            new_payload = {
+                    "sampling_params": sampling_params,
+                    "return_logprob": True,
+                    "top_logprobs_num": state.config.vocab_size,   
+            }
+            new_payload["input_ids"] = input_token_ids
+            new_output = await post(url, new_payload, use_http2=False)
+            response_recompute_index = verification_res["recompute_index"][0]
+            # list[list[[prob,idx,None]]]
+            rollout_probs = recovery_pros(new_output["meta_info"]["output_top_logprobs"][0])
+            # FIXME data type
+            new_distribuation = rollout_probs - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
+            new_distribuation = torch.clamp(new_distribuation,  min = 0)
+            recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+            accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
+        end_recomputation_time = time.time()
+        print(f"Latency: Recomputation{verification_res["recompute_index"][0]} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
+        print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
+        # TEST 
+        # accepted_tokens = new_response_tokens
         sample.tokens = sample.tokens + accepted_tokens
         sample.response_length += len(accepted_tokens)
         # logging.info(f"Sample response length: {sample.response_length}")
@@ -257,15 +260,16 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         round_number += 1
     # 3.2 deal with sample status
     # FIXME how to deal with truncated max or truncated spec
-    # print(sample.response)
-    match output["meta_info"]["finish_reason"]["type"]:
-        case "length":
-            # IF the last response is truncated, we should set the status to TRUNCATED
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case "stop":
-            sample.status = Sample.Status.COMPLETED
+    # print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
+    if sample.status != Sample.Status.COMPLETED:
+        match output["meta_info"]["finish_reason"]["type"]:
+            case "length":
+                # IF the last response is truncated, we should set the status to TRUNCATED
+                sample.status = Sample.Status.TRUNCATED
+            case "abort":
+                sample.status = Sample.Status.ABORTED
+            case "stop":
+                sample.status = Sample.Status.COMPLETED
     return sample
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -372,7 +376,10 @@ async def generate_and_rm(args, sample: Sample, sampling_params: dict, actor_mod
             if evaluation:
                 sample = sample = await generate(args, sample, sampling_params)
             else:
-                sample = sample = await spec_generate(args, sample, actor_model, sampling_params, base_url)
+                if args.use_verify:
+                    sample = sample = await spec_generate(args, sample, actor_model, sampling_params, base_url)
+                else:
+                    sample = await generate(args, sample, sampling_params)
             
 
     # [Change] 

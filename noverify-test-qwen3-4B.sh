@@ -51,7 +51,6 @@ ROLLOUT_ARGS=(
    --over-sampling-batch-size 64
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --balance-data
-   --use-verify
 )
 
 EVAL_ARGS=(
@@ -63,7 +62,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --pipeline-model-parallel-size 1
    --sequence-parallel
    --context-parallel-size 1
@@ -106,9 +105,9 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
+   --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
-   # --sglang-server-concurrency 128
+   --sglang-server-concurrency 128
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 

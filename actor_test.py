@@ -106,6 +106,15 @@ def async_generate(self, rollout_id, evaluation=False):
 def do_verification(self, rollout_id, rollout_data_ref):
     # 1. Get rollout data.
     rollout_data = self._get_verfication_data(rollout_data_ref)
+    if (len(rollout_data["total_lengths"]) == 0):
+        # empty data
+        recompute_data = {
+            "recompute_index": [-1],
+            "recompute_ids": [-1],
+            "logits": [[]],
+            # "log_probs": [[]],
+        }
+        return Box(ray.put(recompute_data))
     # print(rollout_data)
     # Create data iterator for log_probs and train.
     data_iterator, num_microbatches = get_ver_data_iterator(self.args, self.model, rollout_data)
