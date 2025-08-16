@@ -138,7 +138,7 @@ RUNTIME_ENV_JSON="{
 #train_verify.py
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train_verify.py \
+   -- python3 actor_test.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4\
    --rollout-num-gpus 4\
