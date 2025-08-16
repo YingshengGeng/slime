@@ -127,4 +127,6 @@ class RayTrainGroup:
     
     # [Change]
     def async_verification(self,rollout_id, rollout_data_ref):
+        # print(f"DEBUG: Initializing with {len(self._actor_handlers)} actor handlers.")
+        # print(f"DEBUG: Actor handlers list: {self._actor_handlers}")
         return [actor.do_verification.remote(rollout_id, rollout_data_ref) for actor in self._actor_handlers]

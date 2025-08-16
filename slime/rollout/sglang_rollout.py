@@ -58,7 +58,7 @@ class GenerateState(metaclass=SingletonMeta):
     def reset(self):
         self.remaining_batch_size = 0
         self.remaining_sample_size = 0
-        self.lock = threading.Lock()
+        # self.lock = threading.Lock()
         # pendings 用于存储所有未完成的生成任务的 future
         self.pendings = set()
         self.aborted = False
@@ -181,7 +181,7 @@ class BatchingManager:
         urls = [url + '/generate' for url in urls]
         self.recomputation_queues: Dict[str, Queue] = {url: Queue() for url in urls}
         self.rollout_queues: Dict[str, Queue] = {url: Queue() for url in urls}
-        self.actor_queues: Queue = Queue()
+        self.actor_queue: Queue = Queue()
         # FIXME
         self.actor_model = actor_model
 
@@ -192,8 +192,8 @@ class BatchingManager:
         self.recomputation_max_batch_size = 32
         self.recomputation_batch_timeout = recomputation_batch_timeout
         
-        self.verification_max_batch_size = max_batch_size * 4
-        self.verification__batch_timeout = batch_timeout
+        self.verification_max_batch_size = 16
+        self.verification_batch_timeout = batch_timeout
 
 
         self.worker_tasks = []
@@ -212,8 +212,7 @@ class BatchingManager:
             )
         self.worker_tasks.append (
             asyncio.create_task(
-                # FIXME why?
-                self._verification_worker(self.actor_queues)
+                self._verification_worker(self.actor_queue, self.actor_model)
             )
         )
 
@@ -237,7 +236,7 @@ class BatchingManager:
         提交单个请求负载到 actor 队列，并等待结果。
         """
         future = Future()
-        await self.actor_queues.put((temp_data, future))
+        await self.actor_queue.put((temp_data, future))
         self.verification_max_batch_size = min(self.verification_max_batch_size, max(existing_task_num, 1))
         return await future
     
@@ -259,7 +258,7 @@ class BatchingManager:
             batched_data["rollout_log_probs"].extend(data["rollout_log_probs"])
         return batched_data
 
-    def _split_results(self, batched_results: Dict[str, Any], num_requests: int) -> List[Dict[str, Any]]:
+    def _split_results(self, batched_results: List[Dict[str, Any]], num_requests: int) -> List[Dict[str, Any]]:
         """Splits the batched verification result back into individual results."""
         individual_results = []
         for k in batched_results:
@@ -276,38 +275,47 @@ class BatchingManager:
         return individual_results
 
 
-    async def _verification_worker(self):
+    async def _verification_worker(self, queue: Queue, actor_model):
         """Background worker to collect, batch, verify, and distribute results."""
         while True:
             batch_size = self.verification_max_batch_size
-            batch_timeout = self.verification__batch_timeout
+            batch_timeout = self.verification_batch_timeout
             requests: List[Tuple[Dict[str, Any], Future]] = []
            
             # Wait for the first request to start a new batch
-            first_data, first_future = await self.actor_queues.get()
-            requests.append((first_data, first_future))
+            try:
+                first_data, first_future = await queue.get()
+                print("first_data")
+                requests.append((first_data, first_future))
+            except asyncio.CancelledError:
+                break
 
             # Collect more requests until the batch is full or timeout occurs
             while len(requests) < batch_size:
                 try:
-                    data, future = await asyncio.wait_for(self.actor_queues.get(), timeout=batch_timeout)
+                    data, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
                     requests.append((data, future))
-                except asyncio.TimeoutError:
-                    break # Timeout hit, process the current batch
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    break
 
+            if not requests:
+                continue 
+
+            print("enough")
             # 1. Merge all requests into a single, large payload
             batched_data = self._merger_request_batch(requests)
-            if not batched_data:
-                continue
-
+            print(batched_data["response_lengths"])
             print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
 
             # 2. Send the single, large batch to the Ray actor
             # This is the core logic change
-            verification_future = self.actor_model.async_verification(0, Box(ray.put(batched_data)))
+            verification_future = actor_model.async_verification(0, Box(ray.put(batched_data)))
             # list[Box[Object]], Obj [dict[str, list[Any]]]
             box_list = ray.get(verification_future)
-            batched_results = [ray.get(box_list[i]).inner for i in range (len(box_list))]
+            batched_results = [ray.get(box_list[i]).inner for i in len(box_list)]
+            # FIXME more general
+            batched_results = [batched_results[0], batched_results[2]]
+            # batched_results = ray.get(ray.get(box_list[0]).inner)
             
             # 3. Split the batched result back into individual results
             individual_results = self._split_results(batched_results, len(requests))
@@ -381,7 +389,7 @@ class BatchingManager:
         self.worker_tasks = []
         self.recomputation_queues.clear()
         self.rollout_queues.clear()
-        self.actor_queues = Queue()
+        self.actor_queue = Queue()
 
 import time
 # [Change]
@@ -391,7 +399,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     state = GenerateState(args)
     # 2. generate a single sample
     # url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
-    print(f"start: {state.remaining_sample_size}")
+    # print(f"start: {state.remaining_sample_size}")
 
     # abort all the requests
     # MARK 对于所有的 worker 都发送 abort 的请求
@@ -413,7 +421,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         if sample.response_length >= args.rollout_max_response_len:
             break
         # 2.1 deal with data payload & sampling para
-        start_rollout_request_time = time.time()
+        # start_rollout_request_time = time.time()
         sampling_params["max_new_tokens"] = min(round_tokens, max_new_tokens - sample.response_length)
         payload = {
             "sampling_params": sampling_params,
@@ -425,9 +433,9 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         # 2.2 post request
         
         # output = await post(url, payload, use_http2=False)
-        output = await state.manager.submit_request(url, payload, state.remaining_sample_size)
-        end_rollout_request_time = time.time()
-        print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
+        output = await state.manager.submit_request (url, payload, state.remaining_sample_size)
+        # end_rollout_request_time = time.time()
+        # print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
         # 3. deal with response
         # 3.1 deal with metadata
         # start_verification_time = time.time()
@@ -502,8 +510,8 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     # print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
     end_time = time.time()
     print(f"Spec generation for one sample of prompt {sample.index} took {end_time - start_time:.4f} seconds, rounds{round_number}, average_time{(end_time - start_time) / round_number:.4f}. Remining Batch size{state.remaining_batch_size}")  
-    with state.lock: 
-        state.remaining_sample_size -= 1
+    # with state.lock: 
+    state.remaining_sample_size -= 1
     if sample.status != Sample.Status.COMPLETED:
         match output["meta_info"]["finish_reason"]["type"]:
             case "length":

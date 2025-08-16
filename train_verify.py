@@ -15,11 +15,9 @@ from slime import backends
 
 def init_func():
     backends.utils.data.DataIterator = DataIterator
-    MegatronTrainRayActor._get_verfication_data = get_verfication_data
+    MegatronTrainRayActor.get_verfication_data = get_verfication_data
     MegatronTrainRayActor.do_verification = do_verification
-    # RayTrainGroup.async_verification = async_verification
     MegatronTrainRayActor.forward_for_logits = forward_for_logits
-    # Buffer.buffer_generate = buffer_generate
 
 
 

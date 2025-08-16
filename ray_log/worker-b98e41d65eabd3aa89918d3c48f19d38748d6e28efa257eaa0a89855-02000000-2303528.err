@@ -1,0 +1,29 @@
+:job_id:02000000
+:actor_name:MegatronTrainRayActor
+[W816 03:28:17.540816007 Utils.hpp:137] Warning: Environment variable NCCL_ASYNC_ERROR_HANDLING is deprecated; use TORCH_NCCL_ASYNC_ERROR_HANDLING instead (function operator())
+wandb: Currently logged in as: gyswasdfre2255 to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING The `shared` mode feature is experimental and may change. Please contact support@wandb.com for guidance and to report any issues.
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: creating run
+wandb: Tracking run with wandb version 0.21.1
+wandb: Run data is saved locally in /root/slime/wandb/run-20250816_032818-922ll80b
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Resuming run qwen3-4B-test-gsm8k_l8eokn3w-RANK_0
+wandb: ⭐️ View project at https://wandb.ai/gyswasdfre2255/slime-dev
+wandb: 🚀 View run at https://wandb.ai/gyswasdfre2255/slime-dev/runs/922ll80b
+/root/Megatron-LM/megatron/core/models/gpt/gpt_layer_specs.py:102: UserWarning: The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated and will be removed soon. Please update your code accordingly.
+  warnings.warn(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:916: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/opt/conda/envs/torch-base/lib/python3.12/site-packages/torch/distributed/checkpoint/planner_helpers.py:406: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/opt/conda/envs/torch-base/lib/python3.12/site-packages/torch/distributed/checkpoint/default_planner.py:463: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/opt/conda/envs/torch-base/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4631: UserWarning: No device id is provided via `init_process_group` or `barrier `. Using the current device set by the user. 
+  warnings.warn(  # warn only once
+[slime-pp_0] Update weights: 0it [00:00, ?it/s][slime-pp_0] Update weights: 1it [00:00,  2.44it/s][slime-pp_0] Update weights: 2it [00:01,  1.13it/s][slime-pp_0] Update weights: 11it [00:01,  8.80it/s][slime-pp_0] Update weights: 17it [00:01,  9.41it/s]
+[rank0]:[E816 03:44:17.561564365 ProcessGroupNCCL.cpp:1746] [PG ID 5 PG GUID 15(TENSOR_MODEL_PARALLEL_GROUP) Rank 0] ProcessGroupNCCL's watchdog got stuck for 480 seconds without making progress in monitoring enqueued collectives. This typically indicates a NCCL/CUDA API (e.g., CudaEventDestroy) hang blocking the watchdog, and could be triggered by another thread holding the GIL inside a CUDA api (for example, CudaEventDestroy), or other deadlock-prone behaviors.If you suspect the watchdog is not actually stuck and a longer timeout would help, you can either increase the timeout (TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC) to a larger value or disable the heartbeat monitor (TORCH_NCCL_ENABLE_MONITORING=0).If either of aforementioned helps, feel free to file an issue to PyTorch about the short timeout or false positive abort; otherwise, please attempt to debug the hang. 
+[rank0]:[E816 03:44:17.710845111 ProcessGroupNCCL.cpp:1746] [PG ID 0 PG GUID 0(default_pg) Rank 0] Received a dump signal due to a collective timeout from this local rank and we will try our best to dump the debug info. Last enqueued NCCL work: 30, last completed NCCL work: 30.This is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network errors or bugs in the communications library (e.g. NCCL), etc. 
+[rank0]:[E816 03:44:17.711069706 ProcessGroupNCCL.cpp:1536] [PG ID 0 PG GUID 0(default_pg) Rank 0] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1
+[rank0]:[E816 03:44:17.861770807 ProcessGroupNCCL.cpp:1809] [PG ID 5 PG GUID 15(TENSOR_MODEL_PARALLEL_GROUP) Rank 0] Could not acquire GIL within 300 ms on exit, possible GIL induced hang
+[rank0]:[E816 03:44:17.011627969 ProcessGroupNCCL.cpp:1809] [PG ID 0 PG GUID 0(default_pg) Rank 0] Could not acquire GIL within 300 ms on exit, possible GIL induced hang

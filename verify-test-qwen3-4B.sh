@@ -135,7 +135,7 @@ RUNTIME_ENV_JSON="{
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
 }"
-
+#train_verify.py
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_verify.py \

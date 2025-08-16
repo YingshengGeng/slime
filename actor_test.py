@@ -43,9 +43,10 @@ class DataIterator:
                     indices = self.micro_batch_indices[self.offset]
                     batch[key] = [vals[i] for i in indices]
                 else:
+                    # FIXME not reguler shape
                     assert self.offset + self.micro_batch_size <= len(
                         vals
-                    ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}"
+                    ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}, rank: {dist.get_rank()}, key:{key}"
                     batch[key] = vals[self.offset : self.offset + self.micro_batch_size]
 
         if self.micro_batch_indices is not None:
@@ -74,7 +75,9 @@ def get_ver_data_iterator(args, model, rollout_data):
             - num_microbatches: Number of microbatches for log probability evaluation.
     """
 
-    num_local_gbs = len(rollout_data["response_lengths"]) // mpu.get_data_parallel_world_size(with_context_parallel=False)
+    num_local_gbs = len(rollout_data["response_lengths"])
+    # print("num_local_gbs: ", num_local_gbs)
+    # // mpu.get_data_parallel_world_size(with_context_parallel=False)
     # the gradient?
     num_steps_per_rollout = 1
 
@@ -87,10 +90,10 @@ def get_ver_data_iterator(args, model, rollout_data):
         for _ in range(vpp_size):
             data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
         return data_iterator
-
+    # if micro = 1, num_local_gbs = num_local_gbs
     num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
     data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
-
+    # print("num_microbatches: ", num_microbatches)
     return (
         data_iterator,
         num_microbatches,
@@ -105,7 +108,19 @@ def async_generate(self, rollout_id, evaluation=False):
 
 def do_verification(self, rollout_id, rollout_data_ref):
     # 1. Get rollout data.
-    rollout_data = self._get_verfication_data(rollout_data_ref)
+    # print("do_verification start")
+    # print(f"do_verification rank{dis/t.get_rank()}")
+    rollout_data = self.get_verfication_data(rollout_data_ref,
+                        mpu.get_data_parallel_rank(with_context_parallel=False),
+                        mpu.get_data_parallel_world_size(with_context_parallel=False)
+    )
+
+    # print(rollout_data)
+    # Create data iterator for log_probs and train.
+    
+    data_iterator, num_microbatches = get_ver_data_iterator(self.args, self.model, rollout_data)
+    # print("num_microbatches", num_microbatches)
+    # print("len", len(rollout_data["response_lengths"]))
     if (len(rollout_data["response_lengths"]) == 0):
         # empty data
         recompute_data = {
@@ -114,9 +129,6 @@ def do_verification(self, rollout_id, rollout_data_ref):
             "logits": [],
         }
         return Box(ray.put(recompute_data))
-    # print(rollout_data)
-    # Create data iterator for log_probs and train.
-    data_iterator, num_microbatches = get_ver_data_iterator(self.args, self.model, rollout_data)
     # print(self.weights.keys(), self.weights["actor"].keys())
     # 2. Compute log probabilities.
     # print(num_microbatches)
@@ -129,30 +141,33 @@ def do_verification(self, rollout_id, rollout_data_ref):
             is_veri=True,  # FIXME
         )
     )
+    # print("rollout_data num: ", len(rollout_data["log_probs"]))
     # 3. use log probs to compute difference
     recompute_index_list = []
     with torch.no_grad():
         data_len = len(rollout_data["response_lengths"])
-        for i in range(data_len):
-            diff = rollout_data["log_probs"][0] - rollout_data["rollout_log_probs"][0]
+        for k in range(data_len):
+            diff = rollout_data["log_probs"][k] - rollout_data["rollout_log_probs"][k]
             recompute_index = -1
-            for k in range(len(rollout_data["total_lengths"])):
-                for i in range(rollout_data["response_lengths"][k]):
-                    r = torch.rand(1, device=torch.cuda.current_device())
-                    if r > torch.exp(diff[i]).item():
-                        # reject
-                        recompute_index = i
-                        break
+            for i in range(rollout_data["response_lengths"][k]):
+                r = torch.rand(1, device=torch.cuda.current_device())
+                if r > torch.exp(diff[i]).item():
+                    # reject
+                    recompute_index = i
+                    break
             recompute_index_list.append(recompute_index)
-
+    rollout_data.update(
+        {"recompute_index": recompute_index_list}
+    )
+    # print("recompute_index_list: ", recompute_index_list)
+    new_data_iterator, new_num_microbatches = get_ver_data_iterator(self.args, self.model, rollout_data)
     # 3.1 get the full logits for recompute_index
     rollout_data.update(
         self.forward_for_logits(
             self.args,
             "actor",
-            data_iterator,
-            num_microbatches,
-            recompute_index_list,
+            new_data_iterator,
+            new_num_microbatches,
             store_prefix="",
         )
     )
@@ -184,26 +199,26 @@ def do_verification(self, rollout_id, rollout_data_ref):
     return Box(ray.put(recompute_data))
 
 
-def async_verification(self,rollout_id, rollout_data_ref):
-    return [actor.do_verification.remote(rollout_id, rollout_data_ref) for actor in self._actor_handlers]
-
-
-def get_verfication_data(self, rollout_data_ref):
-    dp_rank = mpu.get_data_parallel_rank()
-    dp_size = mpu.get_data_parallel_world_size()
+def get_verfication_data(self, rollout_data_ref, dp_rank, dp_size):
     verification_data = {}
-    
+    # dp_rank = 1
+    # dp_size = 1
+    # print("dp_rank, dp_size: ", dp_rank, dp_size)
     # receive data
     rank = dist.get_rank()
+    # print("start rank: ", rank)
     if rank == 0:
         data = ray.get(rollout_data_ref.inner)
+        # print("len_data_len: ", len(data['response_lengths']))
         dist.broadcast_object_list([data], src=0)
     else:
         data = [None]
         dist.broadcast_object_list(data, src=0)
         data = data[0]
+    # print("end rank ", rank, " get data from broadcast")
     # print("data: ", data)
-    assert data is not None
+    # FIXME why not check not?
+    # assert data is not None
     # FIXME does not deal with rewards, adv
     total_lengths = [len(t) for t in data["tokens"]]
     data["total_lengths"] = total_lengths
@@ -235,7 +250,7 @@ def get_verfication_data(self, rollout_data_ref):
         
 
 @torch.no_grad()
-def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, recompute_index_list, store_prefix="",):
+def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, store_prefix="",):
     # 0. update the weights
     self.update_gpu_params_dict(self.weights[model_tag])
     # """Only do the forward pass and calculate the logprob."""
@@ -257,12 +272,14 @@ def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, r
         """
 
         # Get the batch.
-        batch = get_batch(data_iterator, ["tokens", "total_lengths", "response_lengths"])
+        batch = get_batch(data_iterator, ["tokens", "total_lengths", "response_lengths", "recompute_index"])
+        # print(batch)
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
+        recompute_index_list = batch["recompute_index"]
         output_tensor = model(
             input_ids=tokens,
             position_ids=None,
@@ -277,7 +294,7 @@ def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, r
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
-            recompute_index = recompute_index_list,
+            recompute_index_list = recompute_index_list,
             vocab_size = args.vocab_size 
         )
     # Turn on evaluation mode which disables dropout.
@@ -343,7 +360,8 @@ def get_full_logits(
 
     logits_list = []
     end = 0
-    assert len(unconcat_tokens) == len(total_lengths) == len(response_lengths) == len(recompute_index_list)
+    assert len(unconcat_tokens) == len(total_lengths) == len(response_lengths) == len(recompute_index_list), \
+        f"unconcat_tokens: {len(unconcat_tokens)}, total_lengths: {len(total_lengths)}, response_lengths: {len(response_lengths)}, recompute_index_list: {len(recompute_index_list)}, rank: {dist.get_rank()}"  
     for tokens, total_length, response_length, recompute_index in zip(unconcat_tokens, total_lengths, response_lengths, recompute_index_list):
         end += total_length
         start = end - response_length
@@ -356,7 +374,7 @@ def get_full_logits(
             logits_chunk = logits[end - 2: end]
         logits = calculate_full_logits(logits_chunk) 
         # FIXME 
-        print("logits shape: ", logits.shape)
+        # print("logits shape: ", logits.shape)
         logits_list.append(logits[-1][0][:vocab_size])
         
     return {"logits": logits_list}
@@ -377,53 +395,56 @@ def gather_full_logits(logits: torch.Tensor):
     return full_logits
 
 
-# if __name__ == "__main__":
+if __name__ == "__main__":
 #     # 单例模式应用  
-#     root_logger = logging.getLogger()
-#     root_logger.handlers = []  # 清空现有处理器
-#     logging.basicConfig(format='%(asctime)s: %(message)s',level=logging.INFO)
-#     logging.info("Start")  # 会输出到命令行
+    root_logger = logging.getLogger()
+    root_logger.handlers = []  # 清空现有处理器
+    logging.basicConfig(format='%(asctime)s: %(message)s',level=logging.INFO)
+    logging.info("Start")  # 会输出到命令行
 
-#     # 0.准备函数
-#     MegatronTrainRayActor._get_verfication_data = _get_verfication_data
-#     MegatronTrainRayActor.do_verification = do_verification
-#     MegatronTrainRayActor.compute_log_prob = compute_log_prob
-#     RayTrainGroup.async_verification = async_verification
-#     MegatronTrainRayActor.forward_for_logits = forward_for_logits
+    # 0.准备函数
+    MegatronTrainRayActor.get_verfication_data = get_verfication_data
+    MegatronTrainRayActor.do_verification = do_verification
+    # MegatronTrainRayActor.compute_log_prob = compute_log_prob
+    # RayTrainGroup.async_verification = async_verification
+    MegatronTrainRayActor.forward_for_logits = forward_for_logits
 
     
-#     # FIXME the dropout in probs ?
-#     # 1. 创建参数
-#     args = parse_args()
-#     debug_train_only = True
-#     # args.actor_num_nodes = 1
-#     # args.actor_num_gpus_per_node = 1
-#     args.actor_num_microbatches = 1
-#     args.hf_checkpoint = "/root/Qwen3-4B"
-#     # args.tensor_model_parallel_size = 1
-#     # FIXME if single data exceed max_tokens_per_gpu ？
-#     args.max_tokens_per_gpu = 2048
-#     # 2. 创建资源
-#     num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
-#     # FIXME why reorder
-#     pg, actor_pg_reordered_bundle_indices = _create_placement_group(num_gpus)
-#     pgs = {
-#         "actor": (pg, actor_pg_reordered_bundle_indices),
-#     }
-#     # 3. 基于资源初始化 actor group (A group of actor models)
-#     actor_model = create_actor_group(args, pgs["actor"], wandb_run_id=None)
-#     start_rollout_ids = ray.get(
-#         actor_model.async_init(args, role="actor", with_ref= False)
-#     )
-#     # 4. 准备数据 (Only one sample in batch)
-#     rollout_id = start_rollout_ids[0]
-#     raw_data = {
-#         "tokens": [[1,2,3,4,5,6,7,8,9,10]],
-#         "response_lengths": [5],
-#         "sample_indices": [0],
-#         "rollout_log_probs": [[-0.1]*5],
-#     }
-#     rollout_data_ref = ray.put(Box(ray.put(raw_data)))
-#     # 5. 调用 forward 计算 log prob
-#     recomp_data_ref = ray.get(actor_model.async_verification(rollout_id, rollout_data_ref))
-#     logging.info(recomp_data_ref)
+    # FIXME the dropout in probs ?
+    # 1. 创建参数
+    args = parse_args()
+    debug_train_only = True
+    # args.actor_num_nodes = 1
+    # args.actor_num_gpus_per_node = 1
+    args.actor_num_microbatches = 8
+    args.hf_checkpoint = "/root/Qwen3-4B"
+    # args.tensor_model_parallel_size = 1
+    # FIXME if single data exceed max_tokens_per_gpu ？
+    args.max_tokens_per_gpu = 2048
+    # 2. 创建资源
+    num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    # FIXME why reorder
+    pg, actor_pg_reordered_bundle_indices = _create_placement_group(num_gpus)
+    pgs = {
+        "actor": (pg, actor_pg_reordered_bundle_indices),
+    }
+    # 3. 基于资源初始化 actor group (A group of actor models)
+    actor_model = create_actor_group(args, pgs["actor"], wandb_run_id=None)
+    start_rollout_ids = ray.get(
+        actor_model.async_init(args, role="actor", with_ref= False)
+    )
+    # 4. 准备数据 (Only one sample in batch)
+    rollout_id = start_rollout_ids[0]
+    raw_data = {
+        "tokens": [[1,2,3,4,5,6,7,8,9,10] for i in range(16)],
+        "response_lengths": [5 for i in range(16)],
+        "sample_indices": [0 for i in range(16)],
+        "rollout_log_probs": [[-0.1]*5  for i in range(16) ],
+    }
+    rollout_data_ref = ray.put(Box(ray.put(raw_data)))
+    # 5. 调用 forward 计算 log prob
+    box_list = ray.get(actor_model.async_verification(rollout_id, rollout_data_ref))
+    batched_results = [ray.get(box_list[i].inner) for i in range(len(box_list))]
+    batched_results = [batched_results[0], batched_results[2]]
+    print(len(batched_results), len(batched_results[0]["recompute_index"]), len(batched_results[1]["recompute_index"]))
+    logging.warning(box_list)
