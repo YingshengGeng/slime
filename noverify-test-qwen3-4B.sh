@@ -51,6 +51,7 @@ ROLLOUT_ARGS=(
    --over-sampling-batch-size 64
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --balance-data
+   # --use-verify
 )
 
 EVAL_ARGS=(
@@ -62,7 +63,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --pipeline-model-parallel-size 1
    --sequence-parallel
    --context-parallel-size 1
@@ -73,7 +74,7 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # --micro-batch-size 1
+   # --micro-batch-size 8
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
 )
@@ -105,9 +106,9 @@ WANDB_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.7
-   --sglang-server-concurrency 128
+   # --sglang-server-concurrency 128
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
@@ -134,7 +135,7 @@ RUNTIME_ENV_JSON="{
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
 }"
-
+#train_verify.py
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_verify.py \

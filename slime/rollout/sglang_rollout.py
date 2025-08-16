@@ -186,13 +186,13 @@ class BatchingManager:
         self.actor_model = actor_model
 
 
-        self.rollout_max_batch_size = max_batch_size
+        self.rollout_max_batch_size = 256
         self.rollout_batch_timeout = batch_timeout
 
         self.recomputation_max_batch_size = 32
         self.recomputation_batch_timeout = recomputation_batch_timeout
         
-        self.verification_max_batch_size = 16
+        self.verification_max_batch_size = 256
         self.verification_batch_timeout = batch_timeout
 
 
@@ -282,17 +282,17 @@ class BatchingManager:
             requests: List[Tuple[Dict[str, Any], Future]] = []
             actor_model = self.actor_model
             # Wait for the first request to start a new batch
-            # try:
-            first_data, first_future = await queue.get()
-            print("first_data")
-            requests.append((first_data, first_future))
-            # except asyncio.CancelledError:
-                # break
+            try:
+                first_data, first_future = await queue.get()
+                # print("first_data")
+                requests.append((first_data, first_future))
+            except asyncio.CancelledError:
+                break
 
             # Collect more requests until the batch is full or timeout occurs
             while len(requests) < batch_size:
                 try:
-                    data, future = await asyncio.wait_for(queue.get(), timeout=1000)
+                    data, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
                     requests.append((data, future))
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     break
@@ -300,23 +300,23 @@ class BatchingManager:
             if not requests:
                 continue 
 
-            print("enough")
+            # print("enough")
             # 1. Merge all requests into a single, large payload
             batched_data = self._merger_request_batch(requests)
-            print(batched_data["response_lengths"])
+            # print(batched_data["response_lengths"])
             print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
 
             # 2. Send the single, large batch to the Ray actor
             # This is the core logic change
             box_list = ray.get(actor_model.async_verification(0, ray.put(Box(ray.put(batched_data)))))
             # list[Box[Object]], Obj [dict[str, list[Any]]]
-            print("fix--------------")
-            print(box_list)
+            # print("fix--------------")
+            # print(box_list)
             batched_results = [ray.get(b.inner) for b in box_list]
             # FIXME more general
             batched_results = [batched_results[0], batched_results[2]]
             # batched_results = ray.get(ray.get(box_list[0]).inner)
-            print("finish here")
+            # print("finish here")
             # 3. Split the batched result back into individual results
             individual_results = self._split_results(batched_results, len(requests))
 
@@ -390,7 +390,7 @@ class BatchingManager:
         self.recomputation_queues.clear()
         self.rollout_queues.clear()
         self.actor_queue = Queue()
-        
+
 import time
 # [Change]
 async def spec_generate(args, sample: Sample, actor_model, sampling_params, base_url) -> Sample:
@@ -412,6 +412,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     round_number = 0
     round_tokens = 100
     max_round_number = args.rollout_max_response_len // round_tokens + 10
+    # max_round_number = 1
     max_new_tokens = sampling_params["max_new_tokens"]
     start_time = time.time()
     while round_number < max_round_number:

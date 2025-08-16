@@ -74,7 +74,7 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # --micro-batch-size 1
+   # --micro-batch-size 8
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
 )
