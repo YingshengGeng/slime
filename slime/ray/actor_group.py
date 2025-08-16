@@ -6,7 +6,7 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.backends.megatron_utils import MegatronTrainRayActor
-
+import asyncio
 
 class RayTrainGroup:
     """
@@ -127,6 +127,12 @@ class RayTrainGroup:
     
     # [Change]
     def async_verification(self,rollout_id, rollout_data_ref):
-        # print(f"DEBUG: Initializing with {len(self._actor_handlers)} actor handlers.")
-        # print(f"DEBUG: Actor handlers list: {self._actor_handlers}")
-        return [actor.do_verification.remote(rollout_id, rollout_data_ref) for actor in self._actor_handlers]
+        print(f"DEBUG: Initializing with {len(self._actor_handlers)} actor handlers.")
+        print(f"DEBUG: Actor handlers list: {self._actor_handlers}")
+        futures = []
+        for actor in self._actor_handlers:
+            print(f"call {actor}")
+            future = actor.do_verification.remote(rollout_id, rollout_data_ref)
+            futures.append(future)
+        ray.get(futures)
+        return futures

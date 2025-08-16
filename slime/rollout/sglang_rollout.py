@@ -58,7 +58,7 @@ class GenerateState(metaclass=SingletonMeta):
     def reset(self):
         self.remaining_batch_size = 0
         self.remaining_sample_size = 0
-        # self.lock = threading.Lock()
+        self.lock = threading.Lock()
         # pendings 用于存储所有未完成的生成任务的 future
         self.pendings = set()
         self.aborted = False
@@ -277,54 +277,57 @@ class BatchingManager:
 
     async def _verification_worker(self, queue: Queue, actor_model):
         """Background worker to collect, batch, verify, and distribute results."""
-        while True:
-            batch_size = self.verification_max_batch_size
-            batch_timeout = self.verification_batch_timeout
-            requests: List[Tuple[Dict[str, Any], Future]] = []
-           
-            # Wait for the first request to start a new batch
+        # while True:
+        batch_size = self.verification_max_batch_size
+        batch_timeout = self.verification_batch_timeout
+        requests: List[Tuple[Dict[str, Any], Future]] = []
+        
+        # Wait for the first request to start a new batch
+        try:
+            first_data, first_future = await queue.get()
+            print("first_data")
+            requests.append((first_data, first_future))
+        # except asyncio.CancelledError:
+        #     break
+
+        # Collect more requests until the batch is full or timeout occurs
+        while len(requests) < batch_size:
             try:
-                first_data, first_future = await queue.get()
-                print("first_data")
-                requests.append((first_data, first_future))
-            except asyncio.CancelledError:
+                data, future = await asyncio.wait_for(queue.get(), timeout=1000)
+                requests.append((data, future))
+            except (asyncio.TimeoutError, asyncio.CancelledError):
                 break
 
-            # Collect more requests until the batch is full or timeout occurs
-            while len(requests) < batch_size:
-                try:
-                    data, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
-                    requests.append((data, future))
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    break
+        if not requests:
+            return 
 
-            if not requests:
-                continue 
+        print("enough")
+        # 1. Merge all requests into a single, large payload
+        batched_data = self._merger_request_batch(requests)
+        print(batched_data["response_lengths"])
+        print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
 
-            print("enough")
-            # 1. Merge all requests into a single, large payload
-            batched_data = self._merger_request_batch(requests)
-            print(batched_data["response_lengths"])
-            print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
+        # 2. Send the single, large batch to the Ray actor
+        # This is the core logic change
+        box_list = await actor_model.async_verification(0, ray.put(Box(ray.put(batched_data))))
+        # list[Box[Object]], Obj [dict[str, list[Any]]]
+        print("fix--------------")
+        futures = [b.inner for b in box_list]
+        batched_results = await asyncio.gather(*futures)
+        # [await box_list[i].inner for i in len(box_list)]
+        # FIXME more general
 
-            # 2. Send the single, large batch to the Ray actor
-            # This is the core logic change
-            verification_future = actor_model.async_verification(0, Box(ray.put(batched_data)))
-            # list[Box[Object]], Obj [dict[str, list[Any]]]
-            box_list = ray.get(verification_future)
-            batched_results = [ray.get(box_list[i]).inner for i in len(box_list)]
-            # FIXME more general
-            batched_results = [batched_results[0], batched_results[2]]
-            # batched_results = ray.get(ray.get(box_list[0]).inner)
-            
-            # 3. Split the batched result back into individual results
-            individual_results = self._split_results(batched_results, len(requests))
+        batched_results = [batched_results[0], batched_results[2]]
+        # batched_results = ray.get(ray.get(box_list[0]).inner)
+        
+        # 3. Split the batched result back into individual results
+        individual_results = self._split_results(batched_results, len(requests))
 
-            # 4. Distribute the individual results back to the waiting futures
-            for i, result in enumerate(individual_results):
-                original_future = requests[i][1]
-                original_future.set_result(result)
-            print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests.")
+        # 4. Distribute the individual results back to the waiting futures
+        for i, result in enumerate(individual_results):
+            original_future = requests[i][1]
+            original_future.set_result(result)
+        print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests.")
 
 
     async def _batching_worker(self, url: str, queue: Queue, tag: int):
@@ -510,8 +513,8 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     # print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
     end_time = time.time()
     print(f"Spec generation for one sample of prompt {sample.index} took {end_time - start_time:.4f} seconds, rounds{round_number}, average_time{(end_time - start_time) / round_number:.4f}. Remining Batch size{state.remaining_batch_size}")  
-    # with state.lock: 
-    state.remaining_sample_size -= 1
+    with state.lock: 
+        state.remaining_sample_size -= 1
     if sample.status != Sample.Status.COMPLETED:
         match output["meta_info"]["finish_reason"]["type"]:
             case "length":
