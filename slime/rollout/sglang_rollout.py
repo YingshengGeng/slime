@@ -324,11 +324,14 @@ class BatchingManager:
                 # 2. Send the single, large batch to the Ray actor
                 # This is the core logic change
                 submit_star_time = time.time()
-                box_list = ray.get(actor_model.async_verification(0, ray.put(Box(ray.put(batched_data)))))
+                box_list = await actor_model.async_verification(0, ray.put(Box(ray.put(batched_data))))
                 # list[Box[Object]], Obj [dict[str, list[Any]]]
                 # print("fix--------------")
                 # print(box_list)
-                batched_results = [ray.get(b.inner) for b in box_list]
+                # 3. Wait for the results to be ready
+                batched_results = [b.inner for b in box_list]
+                batched_results = await asyncio.gather(*batched_results)
+                # batched_results = [ray.get(b.inner) for b in box_list]
                 # FIXME more general
                 batched_results = [batched_results[0], batched_results[2]]
                 # batched_results = ray.get(ray.get(box_list[0]).inner)
@@ -347,6 +350,14 @@ class BatchingManager:
             for _data, future in requests:
                 if not future.done():
                     future.set_exception(asyncio.CancelledError("Worker was cancelled during processing."))
+        except Exception as e:
+            import traceback
+            print(f"VERIFICATION WORKER: An unexpected error occurred: {e}")
+            traceback.print_exc() # This will print the full error traceback
+            # Optionally, set the exception on the futures so callers aren't stuck waiting
+            for _data, future in requests:
+                if not future.done():
+                    future.set_exception(e)
         finally:
             print("VERIFICATION WORKER has shut down.")
 

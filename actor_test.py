@@ -111,11 +111,11 @@ def async_generate(self, rollout_id, evaluation=False):
 
 
 
-def do_verification(self, rollout_id, rollout_data_ref):
+async def do_verification(self, rollout_id, rollout_data_ref):
     # 1. Get rollout data.
     # print("do_verification start")
     # print(f"do_verification rank{dis/t.get_rank()}")
-    rollout_data = self.get_verfication_data(rollout_data_ref,
+    rollout_data = await self.get_verfication_data(rollout_data_ref,
                         mpu.get_data_parallel_rank(with_context_parallel=False),
                         mpu.get_data_parallel_world_size(with_context_parallel=False)
     )
@@ -204,7 +204,7 @@ def do_verification(self, rollout_id, rollout_data_ref):
     return Box(ray.put(recompute_data))
 
 
-def get_verfication_data(self, rollout_data_ref, dp_rank, dp_size):
+async def get_verfication_data(self, rollout_data_ref, dp_rank, dp_size):
     verification_data = {}
     # dp_rank = 1
     # dp_size = 1
@@ -213,7 +213,7 @@ def get_verfication_data(self, rollout_data_ref, dp_rank, dp_size):
     rank = dist.get_rank()
     # print("start rank: ", rank)
     if rank == 0:
-        data = ray.get(rollout_data_ref.inner)
+        data = await rollout_data_ref.inner
         # print("len_data_len: ", len(data['response_lengths']))
         dist.broadcast_object_list([data], src=0)
     else:
@@ -439,7 +439,7 @@ async def test():
     start_rollout_ids = ray.get(
         actor_model.async_init(args, role="actor", with_ref= False)
     )
-    manager = BatchingManager([], actor_model=actor_model)
+    manager = BatchingManager(["123"], actor_model=actor_model)
     # 4. 准备数据 (Only one sample in batch)
     rollout_id = start_rollout_ids[0]
     # """
@@ -454,6 +454,7 @@ async def test():
     }
     tasks = [manager.submit_actor_request(raw_data, 91) for _ in range(91)]
     batched_results = await asyncio.gather(*tasks)
+    await manager.abort()
     # batched_results = [batched_results[0], batched_results[2]]
     # data_num = 7
     # raw_data = {

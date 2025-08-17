@@ -126,7 +126,7 @@ class RayTrainGroup:
         return [actor.sleep.remote(("model")) for actor in self._actor_handlers]
     
     # [Change]
-    def async_verification(self,rollout_id, rollout_data_ref):
+    async def async_verification(self,rollout_id, rollout_data_ref):
         # print(f"DEBUG: Initializing with {len(self._actor_handlers)} actor handlers.")
         # print(f"DEBUG: Actor handlers list: {self._actor_handlers}")
         futures = []
@@ -134,5 +134,6 @@ class RayTrainGroup:
             # print(f"call {actor}")
             future = actor.do_verification.remote(rollout_id, rollout_data_ref)
             futures.append(future)
-        ray.get(futures)
+        # MARK here is future
+        futures = await asyncio.gather(*futures)
         return futures
