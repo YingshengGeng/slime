@@ -49,7 +49,7 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1.0
    --global-batch-size 256
    --over-sampling-batch-size 64
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --balance-data
    --use-verify
 )
@@ -135,10 +135,11 @@ RUNTIME_ENV_JSON="{
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
 }"
-#train_verify.py
+#actor_test.py
+#train_verify
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 actor_test.py \
+   -- python3 train_verify.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4\
    --rollout-num-gpus 4\

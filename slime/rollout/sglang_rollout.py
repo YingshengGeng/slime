@@ -18,7 +18,7 @@ from .rm_hub import async_rm, batched_async_rm
 import requests
 import threading
 __all__ = ["generate_rollout"]
-
+import time
 
 import asyncio
 import time
@@ -185,7 +185,7 @@ class BatchingManager:
         # FIXME
         self.actor_model = actor_model
 
-
+        #FIXME
         self.rollout_max_batch_size = 256
         self.rollout_batch_timeout = batch_timeout
 
@@ -195,6 +195,7 @@ class BatchingManager:
         self.verification_max_batch_size = 256
         self.verification_batch_timeout = batch_timeout
 
+        self.aborted = False
 
         self.worker_tasks = []
 
@@ -215,33 +216,42 @@ class BatchingManager:
                 self._verification_worker(self.actor_queue, self.actor_model)
             )
         )
+        self.lock = asyncio.Lock()
 
     async def submit_request(self, url: str, payload: dict, existing_task_num) -> dict:
         """
         提交单个请求负载到相应的队列，并等待结果。
         """
-        future = Future()
-        try:
-            if payload.get("sampling_params", {}).get("max_new_tokens") == 1:
-                await self.recomputation_queues[url].put((payload, future))
-                self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, max(existing_task_num/4, 1))
+        async with self.lock:
+            future = Future()
+            if self.aborted:
+                future.set_exception(asyncio.CancelledError("BatchingManager was aborted."))
             else:
-                await self.rollout_queues[url].put((payload, future))
-                self.rollout_max_batch_size = min(self.rollout_max_batch_size, max(existing_task_num,1))
-        except asyncio.CancelledError and IndexError:
-            future.set_exception(asyncio.CancelledError("BatchingManager was aborted."))
+                try:
+                    if payload.get("sampling_params", {}).get("max_new_tokens") == 1:
+                        await self.recomputation_queues[url].put((payload, future))
+                        self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, max(existing_task_num/4, 1))
+                    else:
+                        await self.rollout_queues[url].put((payload, future))
+                        self.rollout_max_batch_size = min(self.rollout_max_batch_size, max(existing_task_num,1))
+                except (asyncio.CancelledError, IndexError):
+                    future.set_exception(asyncio.CancelledError("BatchingManager was aborted."))
         return await future    
     
     async def submit_actor_request(self, temp_data: dict, existing_task_num) -> dict:
         """
         提交单个请求负载到 actor 队列，并等待结果。
         """
-        future = Future()
-        try:
-            await self.actor_queue.put((temp_data, future))
-            self.verification_max_batch_size = min(self.verification_max_batch_size, max(existing_task_num, 1))
-        except asyncio.CancelledError:
-            future.set_exception(asyncio.CancelledError("BatchingManager was aborted."))
+        async with self.lock:
+            future = Future()
+            if self.aborted:
+                future.set_exception(asyncio.CancelledError("BatchingManager was aborted."))
+            else:
+                try:
+                    await self.actor_queue.put((temp_data, future))
+                    self.verification_max_batch_size = min(self.verification_max_batch_size, max(existing_task_num, 1))
+                except asyncio.CancelledError:
+                    future.set_exception(asyncio.CancelledError("BatchingManager was aborted."))
         return await future
     
     def _merger_request_batch(self, requests: List[Tuple[dict, Future]]) -> Dict[str, Any]:
@@ -280,149 +290,166 @@ class BatchingManager:
 
     async def _verification_worker(self, queue: Queue, actor_model):
         """Background worker to collect, batch, verify, and distribute results."""
-        while True:
-            batch_size = self.verification_max_batch_size
-            batch_timeout = self.verification_batch_timeout
-            requests: List[Tuple[Dict[str, Any], Future]] = []
-            actor_model = self.actor_model
-            # Wait for the first request to start a new batch
-            try:
+        try:
+            while not self.aborted:
+                batch_size = self.verification_max_batch_size
+                batch_timeout = self.verification_batch_timeout
+                requests: List[Tuple[Dict[str, Any], Future]] = []
+                actor_model = self.actor_model
+                # Wait for the first request to start a new batch
+                
                 first_data, first_future = await queue.get()
                 # print("first_data")
                 requests.append((first_data, first_future))
-            except asyncio.CancelledError:
-                break
 
-            # Collect more requests until the batch is full or timeout occurs
-            while len(requests) < batch_size:
-                try:
-                    data, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
-                    requests.append((data, future))
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    break
+                # Collect more requests until the batch is full or timeout occurs
+                while len(requests) < batch_size:
+                    try:
+                        # FIXME 
+                        payload, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
+                        requests.append((payload, future))
+                    except (asyncio.TimeoutError):
+                        break
+                    
+                if not requests:
+                    continue 
 
-            if not requests:
-                continue 
+                # print("enough")
+                # 1. Merge all requests into a single, large payload
+                batched_data = self._merger_request_batch(requests)
+                # print(batched_data["response_lengths"])
+                print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
 
-            # print("enough")
-            # 1. Merge all requests into a single, large payload
-            batched_data = self._merger_request_batch(requests)
-            # print(batched_data["response_lengths"])
-            print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
+                # 2. Send the single, large batch to the Ray actor
+                # This is the core logic change
+                box_list = ray.get(actor_model.async_verification(0, ray.put(Box(ray.put(batched_data)))))
+                # list[Box[Object]], Obj [dict[str, list[Any]]]
+                # print("fix--------------")
+                # print(box_list)
+                batched_results = [ray.get(b.inner) for b in box_list]
+                # FIXME more general
+                batched_results = [batched_results[0], batched_results[2]]
+                # batched_results = ray.get(ray.get(box_list[0]).inner)
+                # print("finish here")
+                # 3. Split the batched result back into individual results
+                individual_results = self._split_results(batched_results, len(requests))
 
-            # 2. Send the single, large batch to the Ray actor
-            # This is the core logic change
-            box_list = ray.get(actor_model.async_verification(0, ray.put(Box(ray.put(batched_data)))))
-            # list[Box[Object]], Obj [dict[str, list[Any]]]
-            # print("fix--------------")
-            # print(box_list)
-            batched_results = [ray.get(b.inner) for b in box_list]
-            # FIXME more general
-            batched_results = [batched_results[0], batched_results[2]]
-            # batched_results = ray.get(ray.get(box_list[0]).inner)
-            # print("finish here")
-            # 3. Split the batched result back into individual results
-            individual_results = self._split_results(batched_results, len(requests))
-
-            # 4. Distribute the individual results back to the waiting futures
-            for i, result in enumerate(individual_results):
-                original_future = requests[i][1]
-                original_future.set_result(result)
-            print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests.")
-
+                # 4. Distribute the individual results back to the waiting futures
+                for i, result in enumerate(individual_results):
+                    original_future = requests[i][1]
+                    original_future.set_result(result)
+                print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests.")
+        except (asyncio.CancelledError):
+            print("VERIFICATION WORKER is cancelled. Cleaning up...")
+            # [关键] 为正在处理的请求设置异常，防止调用者无限等待
+            for _data, future in requests:
+                if not future.done():
+                    future.set_exception(asyncio.CancelledError("Worker was cancelled during processing."))
+        finally:
+            print("VERIFICATION WORKER has shut down.")
 
     async def _batching_worker(self, url: str, queue: Queue, tag: int):
         """
         核心后台任务：收集请求，然后使用 asyncio.gather 并发调度它们。
         """
-        
-        while True:
-            if tag == 0:
-                batch_size = self.rollout_max_batch_size
-                batch_timeout = self.rollout_batch_timeout
-            else:
-                batch_size = self.recomputation_max_batch_size
-                batch_timeout = self.recomputation_batch_timeout
-            requests: List[Tuple[dict, Future]] = []
-            
-            try:
+        try:
+            while not self.aborted:
+                if tag == 0:
+                    batch_size = self.rollout_max_batch_size
+                    batch_timeout = self.rollout_batch_timeout
+                else:
+                    batch_size = self.recomputation_max_batch_size
+                    batch_timeout = self.recomputation_batch_timeout
+                requests: List[Tuple[dict, Future]] = []
+                
+                
                 first_payload, first_future = await queue.get()
                 requests.append((first_payload, first_future))
-            except asyncio.CancelledError:
-                break
+               
 
-            while len(requests) < batch_size:
-                try:
-                    # FIXME 
-                    payload, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
-                    requests.append((payload, future))
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    break
-            
-            if not requests:
-                continue
+                while len(requests) < batch_size:
+                    try:
+                        # FIXME 
+                        payload, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
+                        requests.append((payload, future))
+                    except (asyncio.TimeoutError):
+                        break
+                
+                if not requests:
+                    continue
 
-            batch_size = len(requests)
-            print(f"WORKER tag{tag} ({url[-1]}):  {batch_size} requests. Dispatching concurrently...")
+                batch_size = len(requests)
+                print(f"WORKER tag{tag} ({url[-1]}):  {batch_size} requests. Dispatching concurrently...")
 
-            futures = [req[1] for req in requests]
+                futures = [req[1] for req in requests]
 
-            # [!!!] 核心修改：为批次中的每个请求创建一个 post 任务
-            # 我们不再合并 payload，而是为每个 payload 创建一个独立的 post 调用
-            post_tasks = [
-                post(url, req[0], use_http2=False) for req in requests
-            ]
+                # [!!!] 核心修改：为批次中的每个请求创建一个 post 任务
+                # 我们不再合并 payload，而是为每个 payload 创建一个独立的 post 调用
+                post_tasks = [
+                    post(url, req[0], use_http2=False) for req in requests
+                ]
 
-            # [!!!] 使用 asyncio.gather 并发执行所有独立的 post 请求
-            # return_exceptions=True 确保一个请求失败不会导致整个 gather 崩溃
-            concurrent_outputs = await asyncio.gather(*post_tasks, return_exceptions=True)
-            
-            print(f"WORKER tag{tag} ({url[-1]}): Batch of {batch_size} completed. Distributing results.")
-            
-            # 将结果分发回等待的 future
-            for i, output in enumerate(concurrent_outputs):
-                futures[i].set_result(output)
+                # [!!!] 使用 asyncio.gather 并发执行所有独立的 post 请求
+                # return_exceptions=True 确保一个请求失败不会导致整个 gather 崩溃
+                concurrent_outputs = await asyncio.gather(*post_tasks, return_exceptions=True)
+                
+                print(f"WORKER tag{tag} ({url[-1]}): Batch of {batch_size} completed. Distributing results.")
+                
+                # 将结果分发回等待的 future
+                for i, output in enumerate(concurrent_outputs):
+                    futures[i].set_result(output)
+        except asyncio.CancelledError:
+            print(f"WORKER tag{tag} ({url[-1]}) is cancelled. Cleaning up...")
+            # [关键] 为正在处理的请求设置异常，防止调用者无限等待
+            for _payload, future in requests:
+                if not future.done():
+                    future.set_exception(asyncio.CancelledError("Worker was cancelled during processing."))
+        finally:
+            print(f"WORKER tag{tag} ({url[-1]}) has shut down.")
 
 
     async def abort(self):
+        print("abort the batching manager start")
         """
         中止所有待处理的请求并停止批处理工作者。
         """
-        if self.aborted:
-            return
-        self.aborted = True
+        async with self.lock:
+            if self.aborted:
+                return
+            self.aborted = True
 
-        # [核心修改] 创建一个异常，用于通知所有等待的 Future
-        cancellation_exception = asyncio.CancelledError("BatchingManager was aborted.")
+            # [核心修改] 创建一个异常，用于通知所有等待的 Future
+            cancellation_exception = asyncio.CancelledError("BatchingManager was aborted.")
 
-        # [核心修改] 清理所有队列，并为每个待处理的请求设置异常
-        all_queues = list(self.recomputation_queues.values()) + list(self.rollout_queues.values()) + [self.actor_queue]
-        for queue in all_queues:
-            while not queue.empty():
-                try:
-                    # 从队列中取出请求，但不阻塞
-                    _payload, future = queue.get_nowait()
-                    if not future.done():
-                        # 通知等待方，任务已被取消
-                        future.set_exception(cancellation_exception)
-                except queue.Empty:
-                    break # 队列已空
+            # [核心修改] 清理所有队列，并为每个待处理的请求设置异常
+            all_queues = list(self.recomputation_queues.values()) + list(self.rollout_queues.values()) + [self.actor_queue]
+            for queue in all_queues:
+                while not queue.empty():
+                    try:
+                        # 从队列中取出请求，但不阻塞
+                        _payload, future = queue.get_nowait()
+                        if not future.done():
+                            # 通知等待方，任务已被取消
+                            future.set_exception(cancellation_exception)
+                    except queue.Empty:
+                        break # 队列已空
 
-        # 现在可以安全地取消 worker 任务了
-        for task in self.worker_tasks:
-            task.cancel()
-        
-        # 等待所有 worker 任务实际完成取消操作
-        if self.worker_tasks:
-            await asyncio.gather(*self.worker_tasks, return_exceptions=True)
+            # 现在可以安全地取消 worker 任务了
+            for task in self.worker_tasks:
+                task.cancel()
+            
+            # 等待所有 worker 任务实际完成取消操作
+            if self.worker_tasks:
+                await asyncio.gather(*self.worker_tasks, return_exceptions=True)
 
-        self.worker_tasks = []
-        # 清空队列引用（里面的 future 已经处理过了）
-        self.recomputation_queues.clear()
-        self.rollout_queues.clear()
-        self.actor_queue = Queue()
+            self.worker_tasks = []
+            # 清空队列引用（里面的 future 已经处理过了）
+            self.recomputation_queues.clear()
+            self.rollout_queues.clear()
+            self.actor_queue = None
+            print("abort the batching manager end")
 
-import time
+
 # [Change]
 async def spec_generate(args, sample: Sample, actor_model, sampling_params, base_url) -> Sample:
     # 1. deal with initial status
@@ -442,8 +469,8 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     # didn't consider the loss mask here
     round_number = 0
     round_tokens = 100
-    max_round_number = args.rollout_max_response_len // round_tokens + 10
-    # max_round_number = 1
+    # max_round_number = args.rollout_max_response_len // round_tokens + 10
+    max_round_number = 1
     max_new_tokens = sampling_params["max_new_tokens"]
     start_time = time.time()
     try:
@@ -560,9 +587,9 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     finally:
         # [关键] finally 块确保无论成功还是失败，这部分代码都会执行
         end_time = time.time()
-        logging.info(f"Finished generation for sample {sample.index} in {end_time - start_time:.4f}s. Final status: {sample.status.name}")
+        print(f"Finished generation for sample {sample.index} in {end_time - start_time:.4f}s. average round: {round_number}, average round time: {(end_time - start_time)/round_number}, response length: {sample.response_length} ")
 
-        if sample.status != Sample.Status.COMPLETED or sample.status != Sample.Status.ABORTED:
+        if sample.status != Sample.Status.COMPLETED and sample.status != Sample.Status.ABORTED:
             match output["meta_info"]["finish_reason"]["type"]:
                 case "length":
                     # IF the last response is truncated, we should set the status to TRUNCATED
