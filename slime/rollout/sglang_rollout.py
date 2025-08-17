@@ -168,7 +168,7 @@ def recovery_pros(full_top_logprobs: list[list]):
 #     output = await post(url, payload, use_http2=False)
 #     return recovery_pros(output["meta_info"]["output_top_logprobs"][0][0])
 class BatchingManager:
-    def __init__(self, urls: List[str], actor_model, max_batch_size: int = 128, batch_timeout: float = 10, recomputation_batch_timeout:float = 10):
+    def __init__(self, urls: List[str], actor_model, max_batch_size: int = 128, batch_timeout: float = 0.01, recomputation_batch_timeout:float = 0.01):
         """
         初始化批处理管理器。
 
@@ -230,10 +230,10 @@ class BatchingManager:
                 try:
                     if payload.get("sampling_params", {}).get("max_new_tokens") == 1:
                         await self.recomputation_queues[url].put((payload, future))
-                        self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, max(existing_task_num/4, 1))
+                        self.recomputation_max_batch_size = min(self.recomputation_max_batch_size, max(existing_task_num/4/4, 1))
                     else:
                         await self.rollout_queues[url].put((payload, future))
-                        self.rollout_max_batch_size = min(self.rollout_max_batch_size, max(existing_task_num,1))
+                        self.rollout_max_batch_size = min(self.rollout_max_batch_size, max(existing_task_num/4,1))
                 except (asyncio.CancelledError, IndexError):
                     future.set_exception(asyncio.CancelledError("BatchingManager was aborted."))
         return await future    
@@ -301,7 +301,8 @@ class BatchingManager:
                 first_data, first_future = await queue.get()
                 # print("first_data")
                 requests.append((first_data, first_future))
-
+                start_wait = time.time()
+                
                 # Collect more requests until the batch is full or timeout occurs
                 while len(requests) < batch_size:
                     try:
@@ -313,15 +314,16 @@ class BatchingManager:
                     
                 if not requests:
                     continue 
-
+                
                 # print("enough")
                 # 1. Merge all requests into a single, large payload
                 batched_data = self._merger_request_batch(requests)
                 # print(batched_data["response_lengths"])
-                print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests.")
+                print(f"VERIFICATION WORKER: Dispatching a merged batch of {len(requests)} requests, time is {time.time() - start_wait}.")
 
                 # 2. Send the single, large batch to the Ray actor
                 # This is the core logic change
+                submit_star_time = time.time()
                 box_list = ray.get(actor_model.async_verification(0, ray.put(Box(ray.put(batched_data)))))
                 # list[Box[Object]], Obj [dict[str, list[Any]]]
                 # print("fix--------------")
@@ -333,12 +335,12 @@ class BatchingManager:
                 # print("finish here")
                 # 3. Split the batched result back into individual results
                 individual_results = self._split_results(batched_results, len(requests))
-
+                
                 # 4. Distribute the individual results back to the waiting futures
                 for i, result in enumerate(individual_results):
                     original_future = requests[i][1]
                     original_future.set_result(result)
-                print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests.")
+                print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests, total time is {time.time() - submit_star_time}.")
         except (asyncio.CancelledError):
             print("VERIFICATION WORKER is cancelled. Cleaning up...")
             # [关键] 为正在处理的请求设置异常，防止调用者无限等待
@@ -366,7 +368,7 @@ class BatchingManager:
                 first_payload, first_future = await queue.get()
                 requests.append((first_payload, first_future))
                
-
+                start_wait = time.time()
                 while len(requests) < batch_size:
                     try:
                         # FIXME 
@@ -377,12 +379,12 @@ class BatchingManager:
                 
                 if not requests:
                     continue
-
+                    
                 batch_size = len(requests)
-                print(f"WORKER tag{tag} ({url[-1]}):  {batch_size} requests. Dispatching concurrently...")
+                print(f"WORKER {'REC' if tag == 0 else 'ROLL'}:  {batch_size} requests. Dispatching concurrently... time is {time.time() - start_wait}")
 
                 futures = [req[1] for req in requests]
-
+                submit_star_time = time.time()
                 # [!!!] 核心修改：为批次中的每个请求创建一个 post 任务
                 # 我们不再合并 payload，而是为每个 payload 创建一个独立的 post 调用
                 post_tasks = [
@@ -393,19 +395,19 @@ class BatchingManager:
                 # return_exceptions=True 确保一个请求失败不会导致整个 gather 崩溃
                 concurrent_outputs = await asyncio.gather(*post_tasks, return_exceptions=True)
                 
-                print(f"WORKER tag{tag} ({url[-1]}): Batch of {batch_size} completed. Distributing results.")
+                print(f"WORKER {'REC' if tag == 0 else 'ROLL'}: Batch of {batch_size} completed. Distributing results. time is {time.time() - submit_star_time}")
                 
                 # 将结果分发回等待的 future
                 for i, output in enumerate(concurrent_outputs):
                     futures[i].set_result(output)
         except asyncio.CancelledError:
-            print(f"WORKER tag{tag} ({url[-1]}) is cancelled. Cleaning up...")
+            print(f"WORKER {'REC' if tag == 0 else 'ROLL'} is cancelled. Cleaning up...")
             # [关键] 为正在处理的请求设置异常，防止调用者无限等待
             for _payload, future in requests:
                 if not future.done():
                     future.set_exception(asyncio.CancelledError("Worker was cancelled during processing."))
         finally:
-            print(f"WORKER tag{tag} ({url[-1]}) has shut down.")
+            print(f"WORKER {'REC' if tag == 0 else 'ROLL'} has shut down.")
 
 
     async def abort(self):
@@ -467,10 +469,10 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     prompt_tokens_ids = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
     sample.tokens = prompt_tokens_ids
     # didn't consider the loss mask here
-    round_number = 0
+    round_number = 1
     round_tokens = 100
-    # max_round_number = args.rollout_max_response_len // round_tokens + 10
-    max_round_number = 1
+    max_round_number = args.rollout_max_response_len // round_tokens + 10
+    # max_round_number = 1
     max_new_tokens = sampling_params["max_new_tokens"]
     start_time = time.time()
     try:
@@ -481,7 +483,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             if sample.response_length >= args.rollout_max_response_len:
                 break
             # 2.1 deal with data payload & sampling para
-            # start_rollout_request_time = time.time()
+            start_rollout_request_time = time.time()
             sampling_params["max_new_tokens"] = min(round_tokens, max_new_tokens - sample.response_length)
             payload = {
                 "sampling_params": sampling_params,
@@ -494,11 +496,11 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             
             # output = await post(url, payload, use_http2=False)
             output = await state.manager.submit_request (url, payload, state.remaining_sample_size)
-            # end_rollout_request_time = time.time()
+            end_rollout_request_time = time.time()
             # print(f"Latency: Rollout Request took {end_rollout_request_time - start_rollout_request_time:.4f} seconds.")
             # 3. deal with response
             # 3.1 deal with metadata
-            # start_verification_time = time.time()
+            start_verification_time = time.time()
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             
             temp_tokens = sample.tokens + new_response_tokens
@@ -511,13 +513,13 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 
             }
             # FIXME didn't consider the async
-            # verification_res = ray.get(ray.get(actor_model.async_verification(0, Box(ray.put(temp_data)))[0]).inner)
+            
             verification_res = await state.manager.submit_actor_request(temp_data, state.remaining_sample_size)
-            # end_verification_time = time.time()
-            # print(f"Latency: Verification took {end_verification_time - start_verification_time:.4f} seconds.")
+            end_verification_time = time.time()
+            print(f"Latency: Verification took {end_verification_time - start_verification_time:.4f} seconds.")
 
             # transform the index from global to local
-            # start_recomputation_time = time.time()
+            start_recomputation_time = time.time()
             if verification_res["recompute_index"][0] == -1:
                 # if all accepted, and not exceed the max or eos,
                 # we can just append the new response tokens
@@ -540,20 +542,20 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 new_payload["input_ids"] = input_token_ids
                 # new_output = await post(url, new_payload, use_http2=False)
                 new_output = await state.manager.submit_request(url, new_payload, state.remaining_sample_size)
-                # start_recover_top_logprobs = time.time()
+                start_recover_top_logprobs = time.time()
                 response_recompute_index = verification_res["recompute_index"][0]
                 # list[list[[prob,idx,None]]]
                 rollout_probs = recovery_pros(new_output["meta_info"]["output_top_logprobs"][0])
-                # end_recover_top_logprobs = time.time()
+                end_recover_top_logprobs = time.time()
                 # print(f"Latency: Rollout Top Logprobs took {end_recover_top_logprobs - start_recover_top_logprobs:.4f} seconds.")
                 # FIXME data type
                 new_distribuation = rollout_probs - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
                 new_distribuation = torch.clamp(new_distribuation,  min = 0)
                 recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
                 accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
-            # end_recomputation_time = time.time()
-            # print(f"Latency: Recomputation{verification_res['recompute_index']} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
-            print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
+            end_recomputation_time = time.time()
+            print(f"Latency: Recomputation{verification_res['recompute_index']} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
+            print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}, time: {end_recomputation_time - start_rollout_request_time:.4f} seconds")
             # TEST 
             # accepted_tokens = new_response_tokens
             sample.tokens = sample.tokens + accepted_tokens
@@ -567,7 +569,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             round_number += 1
         # 3.2 deal with sample status
         # FIXME how to deal with truncated max or truncated spec
-        # print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}")
+        
     except asyncio.CancelledError:
         # 这是由 manager.abort() 触发的，是一种预期的“异常”
         logging.warning(f"Generation for sample {sample.index} was cancelled.")
@@ -842,6 +844,7 @@ async def generate_rollout_async(args, rollout_id: int, actor_model, data_source
 
             assert len(group) == args.n_samples_per_prompt
             if dynamic_filter is not None and not dynamic_filter(args, group):
+                # 这里的话每次返回，校验后如果没有通过，则会继续发送
                 state.remaining_batch_size -= 1
                 continue
 

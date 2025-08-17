@@ -76,6 +76,8 @@ async def  post(url, payload, use_http2=False, max_retries=60):
     retry_count = 0
     while retry_count < max_retries:
         try:
+            # MARK Task A (async with), Task B (async with)
+            # FIXME why use async with 
             async with httpx.AsyncClient(http1=not use_http2, http2=use_http2, timeout=timeout) as client:
                 response = await client.post(url, json=payload or {})
                 response.raise_for_status()

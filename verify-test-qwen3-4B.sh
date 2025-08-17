@@ -32,7 +32,7 @@ CKPT_ARGS=(
    --ref-load /root/Qwen3-4B_torch_dist
    --load /root/Qwen3-4B_slime/
    --save /root/Qwen3-4B_slime/
-   --save-interval 20
+   --save-interval 5
 )
 
 ROLLOUT_ARGS=(
@@ -49,13 +49,13 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1.0
    --global-batch-size 256
    --over-sampling-batch-size 64
-   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --balance-data
    --use-verify
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
+   --eval-interval 5
    --eval-prompt-data gsm8k /root/gsm8k/test.parquet
    --n-samples-per-eval-prompt 1
    --eval-max-response-len 1024
