@@ -24,6 +24,7 @@ import asyncio
 import time
 from asyncio import Future, Queue
 from typing import List, Tuple, Dict, Any
+import torch.nn.functional as F
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -189,10 +190,10 @@ class BatchingManager:
         self.rollout_max_batch_size = 256
         self.rollout_batch_timeout = batch_timeout
 
-        self.recomputation_max_batch_size = 32
+        self.recomputation_max_batch_size = 128
         self.recomputation_batch_timeout = recomputation_batch_timeout
         
-        self.verification_max_batch_size = 256
+        self.verification_max_batch_size = 512
         self.verification_batch_timeout = batch_timeout
 
         self.aborted = False
@@ -462,6 +463,8 @@ class BatchingManager:
             self.actor_queue = None
             print("abort the batching manager end")
 
+def max_fn (x):
+    return F.normalize(F.relu(x), p=1, dim=-1)
 
 # [Change]
 async def spec_generate(args, sample: Sample, actor_model, sampling_params, base_url) -> Sample:
@@ -562,6 +565,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 # FIXME data type
                 new_distribuation = rollout_probs - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
                 new_distribuation = torch.clamp(new_distribuation,  min = 0)
+                # new_distribuation = max_fn(new_distribuation)
                 recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
                 accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
             end_recomputation_time = time.time()

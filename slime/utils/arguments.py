@@ -421,6 +421,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             parser.add_argument(
+                "--verify-micro-batch-size",
+                type=int,
+                default=None,
+                help=(
+                    "The micro batch size for the verification step. "
+                    "This is used to calculate the log probs of the responses during rollout. "
+                    "If not set, it will be set to the same value as `micro_batch_size`."
+                ),
+            )
+
+            parser.add_argument(
                 "--use-dynamic-batch-size",
                 action="store_true",
                 default=False,

@@ -223,7 +223,7 @@ def verification(args, model, data_iterator, num_microbatches, store_prefix=""):
             # FIXME structure of num_microbatches
             num_microbatches=num_microbatches[step_id],
             seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=args.verify_micro_batch_size,
             forward_only=True,
             collect_non_loss_data=True,
         )

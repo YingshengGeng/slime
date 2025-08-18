@@ -25,6 +25,7 @@ def calculate_log_probs_and_entropy(logits, tokens, with_entropy: bool = False):
     # Without the clone, the backward will trigger inplace edit error.
     # It seems that the function with tp will modify the logits inplace.
     if logits.size(0) != 0:
+        # MARK here is clone
         log_prob = compute_log_probs(logits.clone(), tokens, mpu.get_tensor_model_parallel_group())
     else:
         log_prob = logits.new_zeros((0,))

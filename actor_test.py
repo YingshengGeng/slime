@@ -29,12 +29,14 @@ class DataIterator:
         rollout_data,
         micro_batch_size: Optional[int] = None,
         micro_batch_indices: Optional[list[list[int]]] = None,
+        is_verify  = False
     ):
         self.rollout_data = rollout_data
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
+        self.is_verify = is_verify
 
     def get_next(self, keys):
         batch = {}
@@ -49,11 +51,19 @@ class DataIterator:
                     batch[key] = [vals[i] for i in indices]
                 else:
                     # FIXME not reguler shape
-                    assert self.offset + self.micro_batch_size <= len(
-                        vals
-                    ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}, rank: {dist.get_rank()}, key:{key}"
+                    # FIXME use the last example
+                   
+                    if self.is_verify is True:
+                        # FIXME more beautiful
+                        assert self.offset < len(
+                            vals
+                        ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}, rank: {dist.get_rank()}, key:{key}"
+                    else:
+                        assert self.offset + self.micro_batch_size <= len(
+                            vals
+                        ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}, rank: {dist.get_rank()}, key:{key}"
                     batch[key] = vals[self.offset : self.offset + self.micro_batch_size]
-
+                    # print(f"{key} len: {len(batch[key])}")
         if self.micro_batch_indices is not None:
             self.offset += 1
         else:
@@ -90,14 +100,14 @@ def get_ver_data_iterator(args, model, rollout_data):
     if vpp_size is None:
         vpp_size = 1
 
-    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
+    def _generate_data_iterator(rollout_data, verify_micro_batch_size, micro_batch_indices=None):
         data_iterator = []
         for _ in range(vpp_size):
-            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
+            data_iterator.append(DataIterator(rollout_data, verify_micro_batch_size, micro_batch_indices, is_verify = True))
         return data_iterator
     # if micro = 1, num_local_gbs = num_local_gbs
-    num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
-    data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
+    num_microbatches = [(num_local_gbs + args.verify_micro_batch_size - 1) // args.verify_micro_batch_size for _ in range(num_steps_per_rollout)]
+    data_iterator = _generate_data_iterator(rollout_data, args.verify_micro_batch_size)
     # print("num_microbatches: ", num_microbatches)
     return (
         data_iterator,
@@ -110,7 +120,7 @@ def async_generate(self, rollout_id, evaluation=False):
     return self.data_buffer.generate.remote(rollout_id, self.actor_model, evaluation=evaluation)
 
 
-
+import time
 async def do_verification(self, rollout_id, rollout_data_ref):
     # 1. Get rollout data.
     # print("do_verification start")
@@ -137,6 +147,7 @@ async def do_verification(self, rollout_id, rollout_data_ref):
     # print(self.weights.keys(), self.weights["actor"].keys())
     # 2. Compute log probabilities.
     # print(num_microbatches)
+    # log_prob_st_time = time.time()
     rollout_data.update(
         self.compute_log_prob (
             "actor",
@@ -146,11 +157,16 @@ async def do_verification(self, rollout_id, rollout_data_ref):
             is_veri=True,  # FIXME
         )
     )
+    # log_prob_ed_time = time.time()
+    # print(f"do_verification log_prob time: {log_prob_ed_time - log_prob_st_time}")
     # print("rollout_data num: ", len(rollout_data["log_probs"]))
     # 3. use log probs to compute difference
+    # index_st_time = time.time()
     recompute_index_list = []
     with torch.no_grad():
         data_len = len(rollout_data["response_lengths"])
+        # print(rollout_data["response_lengths"])
+        # print(len(rollout_data["log_probs"]))
         for k in range(data_len):
             diff = rollout_data["log_probs"][k] - rollout_data["rollout_log_probs"][k]
             recompute_index = -1
@@ -161,10 +177,13 @@ async def do_verification(self, rollout_id, rollout_data_ref):
                     recompute_index = i
                     break
             recompute_index_list.append(recompute_index)
+    # index_ed_time = time.time()
+    # print(f"compute index time: {index_ed_time - index_st_time}")
     rollout_data.update(
         {"recompute_index": recompute_index_list}
     )
     # print("recompute_index_list: ", recompute_index_list)
+    # full_st_time = time.time()
     new_data_iterator, new_num_microbatches = get_ver_data_iterator(self.args, self.model, rollout_data)
     # 3.1 get the full logits for recompute_index
     rollout_data.update(
@@ -176,6 +195,8 @@ async def do_verification(self, rollout_id, rollout_data_ref):
             store_prefix="",
         )
     )
+    # full_ed_time = time.time()
+    # print(f"get full logits time: {full_ed_time - full_st_time}")
      
 
     # 4. return rollout data with log probabilities.
@@ -318,7 +339,7 @@ def forward_for_logits(self, args, model_tag, data_iterator, num_microbatches, s
             model=model,
             num_microbatches=num_microbatches[step_id],
             seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=args.verify_micro_batch_size,
             forward_only=True,
             collect_non_loss_data=True,
         )
@@ -366,22 +387,27 @@ def get_full_logits(
 
     logits_list = []
     end = 0
+    # print("len(unconcat_tokens): ", len(unconcat_tokens))
     assert len(unconcat_tokens) == len(total_lengths) == len(response_lengths) == len(recompute_index_list), \
         f"unconcat_tokens: {len(unconcat_tokens)}, total_lengths: {len(total_lengths)}, response_lengths: {len(response_lengths)}, recompute_index_list: {len(recompute_index_list)}, rank: {dist.get_rank()}"  
     for tokens, total_length, response_length, recompute_index in zip(unconcat_tokens, total_lengths, response_lengths, recompute_index_list):
         end += total_length
         start = end - response_length
+        
         # If -1, we compute the next token, else for the index token
         if recompute_index != -1:
             # left shift one
+            # MARK the start will never be zero, we have prefix
             logits_chunk = logits[start - 1 + recompute_index - 1: start - 1 + recompute_index + 1]
         else:
             # FIXME take two for maintain shape
             logits_chunk = logits[end - 2: end]
-        logits = calculate_full_logits(logits_chunk) 
+        # print(f"start: {start}, end: {end}, chunk shape: {logits_chunk.shape}, logits shape: {logits.shape}, recindex: {recompute_index}")
+        # MARK Attention the same name
+        token_logits = calculate_full_logits(logits_chunk) 
         # FIXME 
         # print("logits shape: ", logits.shape)
-        logits_list.append(logits[-1][0][:vocab_size])
+        logits_list.append(token_logits[-1][0][:vocab_size])
         
     return {"logits": logits_list}
 
@@ -419,7 +445,8 @@ async def test():
     # 1. 创建参数
     args = parse_args()
     debug_train_only = True
-    # args.micro_batch_size = 8
+    # args.verify_micro_batch_size = 128
+    
     # args.actor_num_nodes = 1
     # args.actor_num_gpus_per_node = 1
     # args.actor_num_microbatches = 8
@@ -446,14 +473,16 @@ async def test():
     # 测试函数，模拟异步调用。
     # """
     # print("Test Start")
+    # for i in range(0, 10):
     raw_data = {
         "tokens": [[1,2,3,4,5,6,7,8,9,10]],
         "response_lengths": [5 ],
         "sample_indices": [0 ],
         "rollout_log_probs": [[-0.1]*5 ],
     }
-    tasks = [manager.submit_actor_request(raw_data, 91) for _ in range(91)]
+    tasks = [manager.submit_actor_request(raw_data, 128) for _ in range(128)]
     batched_results = await asyncio.gather(*tasks)
+    
     await manager.abort()
     # batched_results = [batched_results[0], batched_results[2]]
     # data_num = 7
@@ -472,7 +501,7 @@ async def test():
     # FIXME how the logical change here
     # print("res: ", len(batched_results), len(batched_results[0]["recompute_index"]), len(batched_results[1]["recompute_index"]))
 
-
+    print("batch_size", args.verify_micro_batch_size)
     
 
 if __name__ == "__main__":
