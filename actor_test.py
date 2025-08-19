@@ -216,6 +216,7 @@ async def do_verification(self, rollout_id, rollout_data_ref):
         "logits": [data.cpu().tolist() for data in rollout_data["logits"]],
         # "log_probs": [data.cpu().tolist() for data in rollout_data["log_probs"]],
     }
+    clear_memory()
     # if dist.get_rank() == 0:
     #     # print(recompute_data)   
     #     print("vocab_size: ", self.args.vocab_size)
