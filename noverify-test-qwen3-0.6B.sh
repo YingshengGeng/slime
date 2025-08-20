@@ -32,7 +32,7 @@ CKPT_ARGS=(
    --ref-load /root/Qwen3-0.6B_torch_dist
    --load /root/Qwen3-0.6B_slime/
    --save /root/Qwen3-0.6B_slime/
-   --save-interval 5
+   --save-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -51,7 +51,8 @@ ROLLOUT_ARGS=(
    --over-sampling-batch-size 64
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --balance-data
-   --use-verify
+   --use-token-output
+   # --use-verify
 )
 
 EVAL_ARGS=(

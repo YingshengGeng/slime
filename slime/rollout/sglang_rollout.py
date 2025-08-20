@@ -539,7 +539,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 # we can just append the new response tokens
                 if sample.response_length + len(new_response_tokens) < args.rollout_max_response_len and \
                 not state.check_match_eos(new_response_tokens[-1]):
-                    new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0]), dim = -1)
+                    new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
                     recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
                     accepted_tokens = new_response_tokens + [recompute_ids]
                 else:
@@ -685,7 +685,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response_token_ids = state.tokenizer(sample.response, add_special_tokens=False)["input_ids"]
         sample.tokens = prompt_tokens_ids + response_token_ids
         sample.response_length = len(response_token_ids)
-
+    
     match output["meta_info"]["finish_reason"]["type"]:
         case "length":
             sample.status = Sample.Status.TRUNCATED

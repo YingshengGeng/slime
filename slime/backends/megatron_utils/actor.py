@@ -261,7 +261,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 ),
                 path,
             )
-
+        # FIXME from commit https://github.com/THUDM/slime/pull/198
+        if not self.args.colocate and not self.args.offload:
+            self.update_cpu_params_dict(self.weights["actor"])
         log_perf_data(rollout_id, self.args)
         Timer().start("train_wait")
 

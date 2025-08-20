@@ -68,10 +68,10 @@ def train(args):
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # TODO extract the duplicated eval logic
         # FIXME generate directly
-        # if args.eval_interval is not None and rollout_id == 0:
-        #     # here is the first step of the epoch, we need to evaluate the model
-        #     eval_rollout_data_ref = ray.get(rollout_manager.async_buffer_generate(rollout_id, evaluation=True))
-        #     ray.get(actor_model.async_eval(rollout_id, eval_rollout_data_ref))
+        if args.eval_interval is not None and rollout_id == 0:
+            # here is the first step of the epoch, we need to evaluate the model
+            eval_rollout_data_ref = ray.get(rollout_manager.async_buffer_generate(rollout_id, evaluation=True))
+            ray.get(actor_model.async_eval(rollout_id, eval_rollout_data_ref))
 
         rollout_data_ref = ray.get(rollout_manager.async_buffer_generate(rollout_id))
 

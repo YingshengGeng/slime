@@ -173,6 +173,7 @@ async def do_verification(self, rollout_id, rollout_data_ref):
             for i in range(rollout_data["response_lengths"][k]):
                 r = torch.rand(1, device=torch.cuda.current_device())
                 if r > torch.exp(diff[i]).item():
+                    # print(diff)
                     # reject
                     recompute_index = i
                     break

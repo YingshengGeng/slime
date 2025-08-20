@@ -393,7 +393,7 @@ def train_one_step(args, rollout_id, step_id, data_iterator, model, optimizer, o
             labels=None,
             packed_seq_params=batch["packed_seq_params"],
         )
-
+        # loss_function(args, batch, num_microbatches, logits)
         return output_tensor, partial(loss_function, args, batch, num_microbatches)
 
     # Forward pass.
@@ -553,7 +553,7 @@ def train(rollout_id, model, optimizer, opt_param_scheduler, data_iterator, num_
             log_dict["train/grad_norm"] = grad_norm
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
-
+            
             if args.use_wandb:
                 log_dict["train/step"] = accumulated_step_id
                 wandb.log(log_dict)
