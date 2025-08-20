@@ -51,7 +51,7 @@ ROLLOUT_ARGS=(
    --over-sampling-batch-size 64
    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --balance-data
-   --use-token-output
+   # --use-token-output
    # --use-verify
 )
 

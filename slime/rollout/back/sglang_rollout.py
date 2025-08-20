@@ -232,8 +232,8 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
             # FIXME data type
             response_recompute_index = verification_res["recompute_index"][0]
             # print(torch.tensor(temp_data["rollout_log_probs"][0][response_recompute_index]).shape)
-            
-            new_distribuation = recovery_pros(temp_data["rollout_full_log_probs"][0][response_recompute_index]) - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
+            # MARK: target - approx
+            new_distribuation = torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1) - recovery_pros(temp_data["rollout_full_log_probs"][0][response_recompute_index])
             new_distribuation = torch.clamp(new_distribuation,  min = 0)
             recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
             response_recompute_index = verification_res["recompute_index"][0]
@@ -327,6 +327,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.tokens = sample.tokens + new_response_tokens
         sample.response_length += len(new_response_tokens)
         sample.response += state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)
+
     else:
         # String-based processing
         sample.response += output["text"]

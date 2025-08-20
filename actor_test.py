@@ -168,12 +168,13 @@ async def do_verification(self, rollout_id, rollout_data_ref):
         # print(rollout_data["response_lengths"])
         # print(len(rollout_data["log_probs"]))
         for k in range(data_len):
+            # MARK: target / approx
             diff = rollout_data["log_probs"][k] - rollout_data["rollout_log_probs"][k]
             recompute_index = -1
             for i in range(rollout_data["response_lengths"][k]):
                 r = torch.rand(1, device=torch.cuda.current_device())
                 if r > torch.exp(diff[i]).item():
-                    # print(diff)
+                    print(f"here: r({r}), ratio{torch.exp(diff[i]).item()}")
                     # reject
                     recompute_index = i
                     break
@@ -211,12 +212,30 @@ async def do_verification(self, rollout_id, rollout_data_ref):
         }
     )
     """
+    with torch.no_grad():
+        for i in range(len(recompute_index_list)):
+            rec_index = recompute_index_list[i]
+            
+            if rec_index == -1:
+                continue
+            response_len = rollout_data["response_lengths"][i]
+            ori_logits = rollout_data["logits"][i]
+            ori_ids = rollout_data["tokens"][i][-response_len:][rec_index]
+            
+            # print("logits shape: ", rollout_data["logits"][i].shape)
+            assert rollout_data["logits"][i].shape[0] == self.args.vocab_size, f"rank: {dist.get_rank()}, logits shape: {rollout_data['logits'][i].shape}, vocab_size: {self.args.vocab_size}"
+            fake_distribuation = torch.softmax(torch.tensor(ori_logits, dtype=torch.float32), dim = -1)
+            assert(rollout_data["log_probs"][i][rec_index] == torch.log(fake_distribuation[ori_ids])), f"rank: {dist.get_rank()}, log_probs: {rollout_data['log_probs'][i][rec_index]}, fake_distribuation: {torch.log(fake_distribuation[rec_index])}, recompute_index: {rec_index}, response_ids: {ori_ids}"
+
     recompute_data = {
         "recompute_index": recompute_index_list,
         "recompute_ids": [0] * len(recompute_index_list),
-        "logits": [data.cpu().tolist() for data in rollout_data["logits"]],
+        "logits": [data.detach().cpu().tolist() for data in rollout_data["logits"]],
         # "log_probs": [data.cpu().tolist() for data in rollout_data["log_probs"]],
     }
+    
+
+    # assert(rollout_data["log_probs"][recompute_index] == fake_distribuation[rollout_data["response_ids"][recompute_index]])
     clear_memory()
     # if dist.get_rank() == 0:
     #     # print(recompute_data)   

@@ -144,6 +144,7 @@ def recovery_pros(full_top_logprobs: list[list]):
     target_order = range(len(full_top_logprobs))
     ori_order = list(log_probs_map.keys())
     ori_order.sort()
+    assert(ori_order == list(target_order)), f"ori_order {ori_order} is not equal to target_order {target_order}"
     # print(find_inconsistent_positions(ori_order, list(target_order)))
     # print(max(ori_order))
     # print("len: ",  len(full_top_logprobs))
@@ -559,14 +560,19 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 start_recover_top_logprobs = time.time()
                 response_recompute_index = verification_res["recompute_index"][0]
                 # list[list[[prob,idx,None]]]
+                print(f"output_top_logprobs: {len(new_output["meta_info"]["output_top_logprobs"])}")
                 rollout_probs = recovery_pros(new_output["meta_info"]["output_top_logprobs"][0])
+                training_probs = torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
                 end_recover_top_logprobs = time.time()
                 # print(f"Latency: Rollout Top Logprobs took {end_recover_top_logprobs - start_recover_top_logprobs:.4f} seconds.")
                 # FIXME data type
-                new_distribuation = rollout_probs - torch.softmax(torch.tensor(verification_res['logits'][0], dtype=torch.float32), dim = -1)
-                new_distribuation = torch.clamp(new_distribuation,  min = 0)
+                # MARK: target - approx
+                print(len(verification_res['logits']), verification_res['logits'][0][0:5])
+                
+                new_distribuation = torch.clamp(training_probs - rollout_probs,  min = 0)
                 # new_distribuation = max_fn(new_distribuation)
                 recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+                assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"recompute_ids {recompute_ids} should be greater than rollout_probs {rollout_probs[recompute_ids]} and training_probs {training_probs[recompute_ids]}"
                 accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
             end_recomputation_time = time.time()
             print(f"Latency: Recomputation{verification_res['recompute_index']} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
@@ -685,7 +691,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response_token_ids = state.tokenizer(sample.response, add_special_tokens=False)["input_ids"]
         sample.tokens = prompt_tokens_ids + response_token_ids
         sample.response_length = len(response_token_ids)
-    
+
     match output["meta_info"]["finish_reason"]["type"]:
         case "length":
             sample.status = Sample.Status.TRUNCATED
