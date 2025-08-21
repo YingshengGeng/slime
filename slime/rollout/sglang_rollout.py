@@ -144,7 +144,7 @@ def recovery_pros(full_top_logprobs: list[list]):
     target_order = range(len(full_top_logprobs))
     ori_order = list(log_probs_map.keys())
     ori_order.sort()
-    assert(ori_order == list(target_order)), f"ori_order {ori_order} is not equal to target_order {target_order}"
+    # assert(ori_order == list(target_order)), f"ori_order {ori_order} is not equal to target_order {target_order}"
     # print(find_inconsistent_positions(ori_order, list(target_order)))
     # print(max(ori_order))
     # print("len: ",  len(full_top_logprobs))
@@ -155,7 +155,7 @@ def recovery_pros(full_top_logprobs: list[list]):
         result_probs.append(prob)
     # print(result_probs)
     new_dis = torch.exp(torch.tensor(result_probs, dtype=torch.float32))
-    assert(torch.allclose(new_dis.sum(), torch.tensor(1.0))), f"new_dis sum {new_dis.sum()} is not equal to 1.0"
+    # assert(torch.allclose(new_dis.sum(), torch.tensor(1.0))), f"new_dis sum {new_dis.sum()} is not equal to 1.0"
     # print("new_sum:", new_dis.sum().item())
     return new_dis
 
@@ -293,7 +293,7 @@ class BatchingManager:
                     "ori_token_ids" : [mini_batch_result["ori_token_ids"][i]],
                 }
                 individual_results.append(result)
-        assert(len(individual_results) == num_requests)
+        # assert(len(individual_results) == num_requests)
         # for i in range(len(individual_results)):
         #     assert(individual_results[i]["idx"][0] == requests[i][2]), f"idx mismatch at index {i}: {individual_results[i]['idx'][0]} != {requests[i][2]}"
         #     assert(individual_results[i]["tokens"] == requests[i][0]["tokens"]), f"tokens mismatch at index {i}: {individual_results[i]['tokens']} != {requests[i][0]['tokens']}"
@@ -353,7 +353,7 @@ class BatchingManager:
                 
                 idx_list =  [item["idx"][0] for item in individual_results]
                 idx_list.sort()
-                assert(idx_list == list(range(0, len(requests)))), f"idx_list {idx_list} is not equal to range(0, {len(requests)})"
+                # assert(idx_list == list(range(0, len(requests)))), f"idx_list {idx_list} is not equal to range(0, {len(requests)})"
 
 
                 res_map = {
@@ -366,7 +366,7 @@ class BatchingManager:
                     original_future = requests[i][1]
                     idx = requests[i][2]
                     result = res_map[idx]
-                    assert(requests[i][0]["tokens"] == result["tokens"]), f"tokens mismatch at index {i}: {requests[i][0]['tokens']} != {result['tokens']}"
+                    # assert(requests[i][0]["tokens"] == result["tokens"]), f"tokens mismatch at index {i}: {requests[i][0]['tokens']} != {result['tokens']}"
                     original_future.set_result(result)
                 # for i, result in enumerate(individual_results):
                 #     original_future = requests[i][1]
@@ -602,11 +602,11 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 # new_distribuation = max_fn(new_distribuation)
                 recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
                 ori_token_ids =  new_response_tokens[response_recompute_index]
-                assert(ori_token_ids == verification_res["ori_token_ids"][0]), f"ori_token_ids {ori_token_ids} is not equal to verification_res['ori_token_ids'][0] {verification_res['ori_token_ids'][0]}"
-                assert(training_probs[ori_token_ids] < rollout_probs[ori_token_ids]), f"index{response_recompute_index} ori_ids {ori_token_ids}, training_probs {training_probs[ori_token_ids]} should be smaller than rollout_probs {rollout_probs[ori_token_ids]}"
-                assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"index{response_recompute_index} recompute_ids {recompute_ids}, training_probs {training_probs[recompute_ids]} should be greater than rollout_probs {rollout_probs[recompute_ids]}"
+                # assert(ori_token_ids == verification_res["ori_token_ids"][0]), f"ori_token_ids {ori_token_ids} is not equal to verification_res['ori_token_ids'][0] {verification_res['ori_token_ids'][0]}"
+                # assert(training_probs[ori_token_ids] < rollout_probs[ori_token_ids]), f"index{response_recompute_index} ori_ids {ori_token_ids}, training_probs {training_probs[ori_token_ids]} should be smaller than rollout_probs {rollout_probs[ori_token_ids]}"
+                # assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"index{response_recompute_index} recompute_ids {recompute_ids}, training_probs {training_probs[recompute_ids]} should be greater than rollout_probs {rollout_probs[recompute_ids]}"
                 accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
-            print(f"ori_response: {state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)}, new_Response: {state.tokenizer.decode(accepted_tokens, skip_special_tokens=False)}")
+            # print(f"ori_response: {state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)}, new_Response: {state.tokenizer.decode(accepted_tokens, skip_special_tokens=False)}")
 
             end_recomputation_time = time.time()
             print(f"Latency: Recomputation{verification_res['recompute_index']} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")

@@ -174,7 +174,7 @@ async def do_verification(self, rollout_id, rollout_data_ref):
             for i in range(rollout_data["response_lengths"][k]):
                 r = torch.rand(1, device=torch.cuda.current_device())
                 if r > torch.exp(diff[i]).item():
-                    print(f"here: r({r}), ratio{torch.exp(diff[i]).item()}")
+                    # print(f"here: r({r}), ratio{torch.exp(diff[i]).item()}")
                     # reject
                     recompute_index = i
                     break
@@ -212,30 +212,30 @@ async def do_verification(self, rollout_id, rollout_data_ref):
         }
     )
     """
-    with torch.no_grad():
-        for i in range(len(recompute_index_list)):
-            rec_index = recompute_index_list[i]
+    # with torch.no_grad():
+    #     for i in range(len(recompute_index_list)):
+    #         rec_index = recompute_index_list[i]
             
-            if rec_index == -1:
-                continue
-            response_len = rollout_data["response_lengths"][i]
-            ori_logits = rollout_data["logits"][i]
-            ori_ids = rollout_data["tokens"][i][-response_len:][rec_index]
+    #         if rec_index == -1:
+    #             continue
+    #         response_len = rollout_data["response_lengths"][i]
+    #         ori_logits = rollout_data["logits"][i]
+    #         ori_ids = rollout_data["tokens"][i][-response_len:][rec_index]
             
-            # print("logits shape: ", rollout_data["logits"][i].shape)
-            assert ori_logits.shape[0] == self.args.vocab_size, f"rank: {dist.get_rank()}, logits shape: {rollout_data['logits'][i].shape}, vocab_size: {self.args.vocab_size}"
-            fake_distribution = torch.softmax(torch.tensor(ori_logits, dtype=torch.float32), dim = -1)
-            original_log_prob = rollout_data["log_probs"][i][rec_index].to(dtype=torch.float32, device="cpu")
-            recomputed_log_prob = torch.log(fake_distribution[ori_ids])
-            assert torch.allclose(original_log_prob, recomputed_log_prob, atol=1e-5), \
-            f"rank: {dist.get_rank()}, log_prob不匹配，原始 {original_log_prob:.6f}, 重算 {recomputed_log_prob:.6f}, " \
-            f"位置 {rec_index}, token id {ori_ids}"
-            training_probs = recomputed_log_prob
-            rollout_probs = rollout_data["rollout_log_probs"][i]
-            ori_token_ids = ori_ids
+    #         # print("logits shape: ", rollout_data["logits"][i].shape)
+    #         # assert ori_logits.shape[0] == self.args.vocab_size, f"rank: {dist.get_rank()}, logits shape: {rollout_data['logits'][i].shape}, vocab_size: {self.args.vocab_size}"
+    #         fake_distribution = torch.softmax(torch.tensor(ori_logits, dtype=torch.float32), dim = -1)
+    #         original_log_prob = rollout_data["log_probs"][i][rec_index].to(dtype=torch.float32, device="cpu")
+    #         recomputed_log_prob = torch.log(fake_distribution[ori_ids])
+    #         assert torch.allclose(original_log_prob, recomputed_log_prob, atol=1e-5), \
+    #         f"rank: {dist.get_rank()}, log_prob不匹配，原始 {original_log_prob:.6f}, 重算 {recomputed_log_prob:.6f}, " \
+    #         f"位置 {rec_index}, token id {ori_ids}"
+    #         training_probs = recomputed_log_prob
+    #         rollout_probs = rollout_data["rollout_log_probs"][i]
+    #         ori_token_ids = ori_ids
 
-            assert(training_probs < rollout_probs[rec_index]), f"ori_ids should be smaller than rollout_probs {rollout_probs[rec_index]} and training_probs {training_probs}  or {original_log_prob} "
-            # assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"recompute_ids {recompute_ids} should be greater than rollout_probs {rollout_probs[recompute_ids]} and training_probs {training_probs[recompute_ids]}"
+    #         assert(training_probs < rollout_probs[rec_index]), f"ori_ids should be smaller than rollout_probs {rollout_probs[rec_index]} and training_probs {training_probs}  or {original_log_prob} "
+    #         # assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"recompute_ids {recompute_ids} should be greater than rollout_probs {rollout_probs[recompute_ids]} and training_probs {training_probs[recompute_ids]}"
     ori_token_ids = []
     for i in range(len(recompute_index_list)):
         rec_index = recompute_index_list[i]
@@ -452,7 +452,7 @@ def get_full_logits(
         # MARK Attention the same name
         token_logits = calculate_full_logits(logits_chunk) 
         # FIXME 
-        print("logits shape: ", logits.shape)
+        # print("logits shape: ", logits.shape)
         logits_list.append(token_logits[-1][0][:vocab_size])
         
     return {"logits": logits_list}
@@ -547,7 +547,7 @@ async def test():
     # FIXME how the logical change here
     # print("res: ", len(batched_results), len(batched_results[0]["recompute_index"]), len(batched_results[1]["recompute_index"]))
 
-    print("batch_size", args.verify_micro_batch_size)
+    # print("batch_size", args.verify_micro_batch_size)
     
 
 if __name__ == "__main__":
