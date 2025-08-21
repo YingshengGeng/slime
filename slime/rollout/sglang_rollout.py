@@ -291,6 +291,7 @@ class BatchingManager:
                     "logits": [mini_batch_result["logits"][i]],
                     "idx": [mini_batch_result["idx"][i]],
                     "ori_token_ids" : [mini_batch_result["ori_token_ids"][i]],
+                    "train_log_probs": [mini_batch_result["train_log_probs"][i]],
                 }
                 individual_results.append(result)
         # assert(len(individual_results) == num_requests)
@@ -378,14 +379,14 @@ class BatchingManager:
             for _data, future in requests:
                 if not future.done():
                     future.set_exception(asyncio.CancelledError("Worker was cancelled during processing."))
-        except Exception as e:
-            import traceback
-            print(f"VERIFICATION WORKER: An unexpected error occurred: {e}")
-            traceback.print_exc() # This will print the full error traceback
-            # Optionally, set the exception on the futures so callers aren't stuck waiting
-            for _data, future in requests:
-                if not future.done():
-                    future.set_exception(e)
+        # except Exception as e:
+        #     import traceback
+        #     print(f"VERIFICATION WORKER: An unexpected error occurred: {e}")
+        #     traceback.print_exc() # This will print the full error traceback
+        #     # Optionally, set the exception on the futures so callers aren't stuck waiting
+        #     for _data, future in requests:
+        #         if not future.done():
+        #             future.set_exception(e)
         finally:
             print("VERIFICATION WORKER has shut down.")
 
@@ -513,7 +514,7 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
     round_number = 1
     round_tokens = 100
     max_round_number = args.rollout_max_response_len // round_tokens + 10
-    # max_round_number = 1
+    # max_round_number = 2
     max_new_tokens = sampling_params["max_new_tokens"]
     start_time = time.time()
     try:
@@ -596,14 +597,19 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 # print(f"Latency: Rollout Top Logprobs took {end_recover_top_logprobs - start_recover_top_logprobs:.4f} seconds.")
                 # FIXME data type
                 # MARK: target - approx
-                print(len(verification_res['logits']), verification_res['logits'][0][0:5])
+                # print(len(verification_res['logits']), verification_res['logits'][0][0:5])
                 
                 new_distribuation = torch.clamp(training_probs - rollout_probs,  min = 0)
                 # new_distribuation = max_fn(new_distribuation)
                 recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
+                # FIXME the compuation error
                 ori_token_ids =  new_response_tokens[response_recompute_index]
+                # 这里多次计算的结果 emmm
+                # assert(temp_data["tokens"] == verification_res["tokens"])
+                # assert(verification_res["train_log_probs"][0][response_recompute_index] < temp_data["rollout_log_probs"][0][response_recompute_index])
+                # assert(temp_data["rollout_log_probs"][0][response_recompute_index] == new_output["meta_info"]["output_top_logprobs"][0][0]),f"rollout_log_probs {temp_data['rollout_log_probs'][0][response_recompute_index]} is not equal to new_output['meta_info']['output_top_logprobs'][0][0] {new_output['meta_info']['output_top_logprobs'][0][0]}"
                 # assert(ori_token_ids == verification_res["ori_token_ids"][0]), f"ori_token_ids {ori_token_ids} is not equal to verification_res['ori_token_ids'][0] {verification_res['ori_token_ids'][0]}"
-                # assert(training_probs[ori_token_ids] < rollout_probs[ori_token_ids]), f"index{response_recompute_index} ori_ids {ori_token_ids}, training_probs {training_probs[ori_token_ids]} should be smaller than rollout_probs {rollout_probs[ori_token_ids]}"
+                # assert(training_probs[ori_token_ids] < rollout_probs[ori_token_ids]), f"index{response_recompute_index} ori_ids {ori_token_ids}, training_probs {training_probs[ori_token_ids]} should be smaller than rollout_probs {rollout_probs[ori_token_ids]} "
                 # assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"index{response_recompute_index} recompute_ids {recompute_ids}, training_probs {training_probs[recompute_ids]} should be greater than rollout_probs {rollout_probs[recompute_ids]}"
                 accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
             # print(f"ori_response: {state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)}, new_Response: {state.tokenizer.decode(accepted_tokens, skip_special_tokens=False)}")
@@ -630,16 +636,16 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
         logging.warning(f"Generation for sample {sample.index} was cancelled.")
         sample.status = Sample.Status.ABORTED
     
-    except (KeyError, IndexError, TypeError) as e:
-        # 捕获数据处理相关的错误
-        logging.error(f"Data processing error for sample {sample.index}: {e}", exc_info=True)
-        sample.status = Sample.Status.ABORTED # 或 FAILED
+    # except (KeyError, IndexError, TypeError) as e:
+    #     # 捕获数据处理相关的错误
+    #     logging.error(f"Data processing error for sample {sample.index}: {e}", exc_info=True)
+    #     sample.status = Sample.Status.ABORTED # 或 FAILED
         
-    except Exception as e:
-        # 捕获所有其他异常，例如来自 worker 的网络错误、Ray错误等
-        # 使用 e.__class__.__name__ 可以获得异常的类型名，如 'ClientConnectorError'
-        logging.error(f"An unexpected error '{e.__class__.__name__}' occurred during generation for sample {sample.index}: {e}", exc_info=True)
-        sample.status = Sample.Status.ABORTED # 或 FAILED
+    # except Exception as e:
+    #     # 捕获所有其他异常，例如来自 worker 的网络错误、Ray错误等
+    #     # 使用 e.__class__.__name__ 可以获得异常的类型名，如 'ClientConnectorError'
+    #     logging.error(f"An unexpected error '{e.__class__.__name__}' occurred during generation for sample {sample.index}: {e}", exc_info=True)
+    #     sample.status = Sample.Status.ABORTED # 或 FAILED
 
     finally:
         # [关键] finally 块确保无论成功还是失败，这部分代码都会执行

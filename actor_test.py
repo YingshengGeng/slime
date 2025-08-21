@@ -254,8 +254,8 @@ async def do_verification(self, rollout_id, rollout_data_ref):
         "logits": [data.detach().cpu().tolist() for data in rollout_data["logits"]],
         "tokens": [data.detach().cpu().tolist() for data in rollout_data["tokens"]],
         "idx": rollout_data["idx"],
-        "ori_token_ids":ori_token_ids
-        # "log_probs": [data.cpu().tolist() for data in rollout_data["log_probs"]],
+        "ori_token_ids":ori_token_ids,
+        "train_log_probs": [data.detach().cpu().tolist() for data in rollout_data["log_probs"]],
     }
     
 
