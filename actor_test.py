@@ -223,14 +223,38 @@ async def do_verification(self, rollout_id, rollout_data_ref):
             ori_ids = rollout_data["tokens"][i][-response_len:][rec_index]
             
             # print("logits shape: ", rollout_data["logits"][i].shape)
-            assert rollout_data["logits"][i].shape[0] == self.args.vocab_size, f"rank: {dist.get_rank()}, logits shape: {rollout_data['logits'][i].shape}, vocab_size: {self.args.vocab_size}"
-            fake_distribuation = torch.softmax(torch.tensor(ori_logits, dtype=torch.float32), dim = -1)
-            assert(rollout_data["log_probs"][i][rec_index] == torch.log(fake_distribuation[ori_ids])), f"rank: {dist.get_rank()}, log_probs: {rollout_data['log_probs'][i][rec_index]}, fake_distribuation: {torch.log(fake_distribuation[rec_index])}, recompute_index: {rec_index}, response_ids: {ori_ids}"
+            assert ori_logits.shape[0] == self.args.vocab_size, f"rank: {dist.get_rank()}, logits shape: {rollout_data['logits'][i].shape}, vocab_size: {self.args.vocab_size}"
+            fake_distribution = torch.softmax(torch.tensor(ori_logits, dtype=torch.float32), dim = -1)
+            original_log_prob = rollout_data["log_probs"][i][rec_index].to(dtype=torch.float32, device="cpu")
+            recomputed_log_prob = torch.log(fake_distribution[ori_ids])
+            assert torch.allclose(original_log_prob, recomputed_log_prob, atol=1e-5), \
+            f"rank: {dist.get_rank()}, log_prob不匹配，原始 {original_log_prob:.6f}, 重算 {recomputed_log_prob:.6f}, " \
+            f"位置 {rec_index}, token id {ori_ids}"
+            training_probs = recomputed_log_prob
+            rollout_probs = rollout_data["rollout_log_probs"][i]
+            ori_token_ids = ori_ids
+
+            assert(training_probs < rollout_probs[rec_index]), f"ori_ids should be smaller than rollout_probs {rollout_probs[rec_index]} and training_probs {training_probs}  or {original_log_prob} "
+            # assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"recompute_ids {recompute_ids} should be greater than rollout_probs {rollout_probs[recompute_ids]} and training_probs {training_probs[recompute_ids]}"
+    ori_token_ids = []
+    for i in range(len(recompute_index_list)):
+        rec_index = recompute_index_list[i]
+            
+        if rec_index == -1:
+            ori_token_ids.append(-1)
+            continue
+        response_len = rollout_data["response_lengths"][i]
+        ori_logits = rollout_data["logits"][i]
+        ori_ids = rollout_data["tokens"][i][-response_len:][rec_index]
+        ori_token_ids.append(ori_ids.detach().cpu().item() )
 
     recompute_data = {
         "recompute_index": recompute_index_list,
         "recompute_ids": [0] * len(recompute_index_list),
         "logits": [data.detach().cpu().tolist() for data in rollout_data["logits"]],
+        "tokens": [data.detach().cpu().tolist() for data in rollout_data["tokens"]],
+        "idx": rollout_data["idx"],
+        "ori_token_ids":ori_token_ids
         # "log_probs": [data.cpu().tolist() for data in rollout_data["log_probs"]],
     }
     
@@ -282,6 +306,7 @@ async def get_verfication_data(self, rollout_data_ref, dp_rank, dp_size):
         "response_lengths",
         "sample_indices",
         "rollout_log_probs",
+        "idx",
     ]:
         if key not in data:
             continue
@@ -404,7 +429,7 @@ def get_full_logits(
     logits.div_(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
-    assert cp_size == 1, f"{cp_size}"
+    assert cp_size == 1, f"cp_size: {cp_size}, rank: {dist.get_rank()}"
 
     logits_list = []
     end = 0
@@ -419,15 +444,15 @@ def get_full_logits(
         if recompute_index != -1:
             # left shift one
             # MARK the start will never be zero, we have prefix
-            logits_chunk = logits[start - 1 + recompute_index - 1: start - 1 + recompute_index + 1]
+            logits_chunk = logits[start - 1 + recompute_index: start - 1 + recompute_index + 1]
         else:
             # FIXME take two for maintain shape
-            logits_chunk = logits[end - 2: end]
+            logits_chunk = logits[end - 1 : end]
         # print(f"start: {start}, end: {end}, chunk shape: {logits_chunk.shape}, logits shape: {logits.shape}, recindex: {recompute_index}")
         # MARK Attention the same name
         token_logits = calculate_full_logits(logits_chunk) 
         # FIXME 
-        # print("logits shape: ", logits.shape)
+        print("logits shape: ", logits.shape)
         logits_list.append(token_logits[-1][0][:vocab_size])
         
     return {"logits": logits_list}

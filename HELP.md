@@ -80,3 +80,7 @@ python com_ben_test_v2.py \
 
 
 python com_ben_test_v2.py --model_path /apdcephfs/private_ethangeng/Qwen3-4B_slime_hf/iter_0000059/ --prompt "中国的首都是什么？请介绍一下它的历史。" --max_new_tokens 100 --num_samples 1 --temperature 1.0
+
+torch.exp(torch.log(torch.tensor(1.6779065116490077e-12,dtype=torch.float)) -torch.log(torch.tensor(2.546399679825937e-16,dtype=torch.float)))
+
+torch.tensor(1.6779065116490077e-12,dtype=torch.float) / torch.tensor(2.546399679825937e-16,dtype=torch.float)

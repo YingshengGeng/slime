@@ -155,6 +155,7 @@ def recovery_pros(full_top_logprobs: list[list]):
         result_probs.append(prob)
     # print(result_probs)
     new_dis = torch.exp(torch.tensor(result_probs, dtype=torch.float32))
+    assert(torch.allclose(new_dis.sum(), torch.tensor(1.0))), f"new_dis sum {new_dis.sum()} is not equal to 1.0"
     # print("new_sum:", new_dis.sum().item())
     return new_dis
 
@@ -262,19 +263,22 @@ class BatchingManager:
             "tokens": [],
             "response_lengths": [],
             "sample_indices": [],
-            "rollout_log_probs": []
+            "rollout_log_probs": [],
+            "idx": [],
+            
         }
 
-        for data, _ in requests:
+        for data, _ , idx in requests:
             # Assumes each data dict contains lists of size 1
             # FIXME list[list[data]] -> list[data]
+            batched_data["idx"].append(idx)
             batched_data["tokens"].extend(data["tokens"])
             batched_data["response_lengths"].extend(data["response_lengths"])
             batched_data["sample_indices"].extend(data["sample_indices"])
             batched_data["rollout_log_probs"].extend(data["rollout_log_probs"])
         return batched_data
 
-    def _split_results(self, batched_results: List[Dict[str, Any]], num_requests: int) -> List[Dict[str, Any]]:
+    def _split_results(self, batched_results: List[Dict[str, Any]], num_requests: int, requests) -> List[Dict[str, Any]]:
         """Splits the batched verification result back into individual results."""
         individual_results = []
         for mini_batch_result in batched_results:
@@ -282,11 +286,17 @@ class BatchingManager:
             for i in range(num):
                 result = {
                     # Assuming the result keys match this structure
+                    "tokens": [mini_batch_result["tokens"][i]],
                     "recompute_index": [mini_batch_result["recompute_index"][i]],
-                    "logits": [mini_batch_result["logits"][i]]
+                    "logits": [mini_batch_result["logits"][i]],
+                    "idx": [mini_batch_result["idx"][i]],
+                    "ori_token_ids" : [mini_batch_result["ori_token_ids"][i]],
                 }
                 individual_results.append(result)
         assert(len(individual_results) == num_requests)
+        # for i in range(len(individual_results)):
+        #     assert(individual_results[i]["idx"][0] == requests[i][2]), f"idx mismatch at index {i}: {individual_results[i]['idx'][0]} != {requests[i][2]}"
+        #     assert(individual_results[i]["tokens"] == requests[i][0]["tokens"]), f"tokens mismatch at index {i}: {individual_results[i]['tokens']} != {requests[i][0]['tokens']}"
         return individual_results
 
 
@@ -302,7 +312,7 @@ class BatchingManager:
                 
                 first_data, first_future = await queue.get()
                 # print("first_data")
-                requests.append((first_data, first_future))
+                requests.append((first_data, first_future, len(requests)))
                 start_wait = time.time()
                 
                 # Collect more requests until the batch is full or timeout occurs
@@ -310,7 +320,7 @@ class BatchingManager:
                     try:
                         # FIXME 
                         payload, future = await asyncio.wait_for(queue.get(), timeout=batch_timeout)
-                        requests.append((payload, future))
+                        requests.append((payload, future, len(requests)))
                     except (asyncio.TimeoutError):
                         break
                     
@@ -339,12 +349,28 @@ class BatchingManager:
                 # batched_results = ray.get(ray.get(box_list[0]).inner)
                 # print("finish here")
                 # 3. Split the batched result back into individual results
-                individual_results = self._split_results(batched_results, len(requests))
+                individual_results = self._split_results(batched_results, len(requests), requests)
                 
+                idx_list =  [item["idx"][0] for item in individual_results]
+                idx_list.sort()
+                assert(idx_list == list(range(0, len(requests)))), f"idx_list {idx_list} is not equal to range(0, {len(requests)})"
+
+
+                res_map = {
+                    item["idx"][0]: item for item in individual_results  
+                }
+
                 # 4. Distribute the individual results back to the waiting futures
-                for i, result in enumerate(individual_results):
+
+                for i in range(len(requests)):  
                     original_future = requests[i][1]
+                    idx = requests[i][2]
+                    result = res_map[idx]
+                    assert(requests[i][0]["tokens"] == result["tokens"]), f"tokens mismatch at index {i}: {requests[i][0]['tokens']} != {result['tokens']}"
                     original_future.set_result(result)
+                # for i, result in enumerate(individual_results):
+                #     original_future = requests[i][1]
+                #     original_future.set_result(result)
                 print(f"VERIFICATION WORKER: completed and Distributed results to {len(requests)} requests, total time is {time.time() - submit_star_time}.")
         except (asyncio.CancelledError):
             print("VERIFICATION WORKER is cancelled. Cleaning up...")
@@ -554,11 +580,14 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                         "return_logprob": True,
                         "top_logprobs_num": state.config.vocab_size,   
                 }
-                new_payload["input_ids"] = input_token_ids
+                response_recompute_index = verification_res["recompute_index"][0]
+                # BUG the new should be 
+                # new_payload["input_ids"] = input_token_ids
+                new_payload["input_ids"] = input_token_ids + new_response_tokens[:response_recompute_index]
                 # new_output = await post(url, new_payload, use_http2=False)
                 new_output = await state.manager.submit_request(url, new_payload, state.remaining_sample_size)
                 start_recover_top_logprobs = time.time()
-                response_recompute_index = verification_res["recompute_index"][0]
+                
                 # list[list[[prob,idx,None]]]
                 print(f"output_top_logprobs: {len(new_output["meta_info"]["output_top_logprobs"])}")
                 rollout_probs = recovery_pros(new_output["meta_info"]["output_top_logprobs"][0])
@@ -572,8 +601,13 @@ async def spec_generate(args, sample: Sample, actor_model, sampling_params, base
                 new_distribuation = torch.clamp(training_probs - rollout_probs,  min = 0)
                 # new_distribuation = max_fn(new_distribuation)
                 recompute_ids = sample_from_the_logits(new_distribuation, sampling_params).item()
-                assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"recompute_ids {recompute_ids} should be greater than rollout_probs {rollout_probs[recompute_ids]} and training_probs {training_probs[recompute_ids]}"
+                ori_token_ids =  new_response_tokens[response_recompute_index]
+                assert(ori_token_ids == verification_res["ori_token_ids"][0]), f"ori_token_ids {ori_token_ids} is not equal to verification_res['ori_token_ids'][0] {verification_res['ori_token_ids'][0]}"
+                assert(training_probs[ori_token_ids] < rollout_probs[ori_token_ids]), f"index{response_recompute_index} ori_ids {ori_token_ids}, training_probs {training_probs[ori_token_ids]} should be smaller than rollout_probs {rollout_probs[ori_token_ids]}"
+                assert(training_probs[recompute_ids] >= rollout_probs[recompute_ids]), f"index{response_recompute_index} recompute_ids {recompute_ids}, training_probs {training_probs[recompute_ids]} should be greater than rollout_probs {rollout_probs[recompute_ids]}"
                 accepted_tokens = new_response_tokens[:response_recompute_index] + [recompute_ids]
+            print(f"ori_response: {state.tokenizer.decode(new_response_tokens, skip_special_tokens=False)}, new_Response: {state.tokenizer.decode(accepted_tokens, skip_special_tokens=False)}")
+
             end_recomputation_time = time.time()
             print(f"Latency: Recomputation{verification_res['recompute_index']} took {end_recomputation_time - start_recomputation_time:.4f} seconds.")
             print(f"Round {round_number}, recompute index: {verification_res['recompute_index']}, recompute token id: {recompute_ids}, accepted tokens: {len(accepted_tokens)}, response_length: {sample.response_length}, time: {end_recomputation_time - start_rollout_request_time:.4f} seconds")
